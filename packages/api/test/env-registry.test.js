@@ -9,7 +9,14 @@ import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
 import { afterEach, describe, it } from 'node:test';
 import Fastify from 'fastify';
-import { buildEnvSummary, ENV_CATEGORIES, ENV_VARS, maskUrlCredentials } from '../dist/config/env-registry.js';
+import {
+  buildEnvSummary,
+  ENV_CATEGORIES,
+  ENV_VARS,
+  hasSensitiveEditableVars,
+  isSensitiveEditableEnvVar,
+  maskUrlCredentials,
+} from '../dist/config/env-registry.js';
 
 // Save and restore env vars around tests
 const savedEnv = {};
@@ -65,6 +72,22 @@ describe('env-registry', () => {
     assert.equal(apiKey.sensitive, true);
   });
 
+  it('registers KIMI_QUOTA_API_FALLBACK_ENABLED as bootstrap-only quota config', () => {
+    const def = ENV_VARS.find((v) => v.name === 'KIMI_QUOTA_API_FALLBACK_ENABLED');
+    assert.ok(def, 'KIMI_QUOTA_API_FALLBACK_ENABLED should be in registry');
+    assert.equal(def.category, 'quota');
+    assert.equal(def.runtimeEditable, false);
+    assert.equal(def.hubVisible, false);
+  });
+
+  it('registers KIMI_CONFIG_FILE as bootstrap-only kimi config', () => {
+    const def = ENV_VARS.find((v) => v.name === 'KIMI_CONFIG_FILE');
+    assert.ok(def, 'KIMI_CONFIG_FILE should be in registry');
+    assert.equal(def.category, 'kimi');
+    assert.equal(def.runtimeEditable, false);
+    assert.equal(def.hubVisible, false);
+  });
+
   it('REDIS_URL has maskMode url', () => {
     const redis = ENV_VARS.find((v) => v.name === 'REDIS_URL');
     assert.ok(redis, 'REDIS_URL should be in registry');
@@ -100,6 +123,34 @@ describe('env-registry', () => {
   it('no HINDSIGHT_* vars remain after D-1 cleanup', () => {
     const hindsightVars = ENV_VARS.filter((v) => v.name.startsWith('HINDSIGHT_'));
     assert.equal(hindsightVars.length, 0, 'All HINDSIGHT_* vars should be removed');
+  });
+
+  it('marks GITHUB_MCP_PAT, F102_API_KEY as sensitive + runtimeEditable (#340 P6: OPENAI_API_KEY removed)', () => {
+    for (const name of ['GITHUB_MCP_PAT', 'F102_API_KEY']) {
+      const def = ENV_VARS.find((v) => v.name === name);
+      assert.ok(def, `${name} should be in registry`);
+      assert.equal(def.sensitive, true, `${name} should be sensitive`);
+      assert.equal(def.runtimeEditable, true, `${name} should be runtimeEditable`);
+      assert.ok(isSensitiveEditableEnvVar(def), `${name} should pass isSensitiveEditableEnvVar`);
+    }
+    // #340 P6: OPENAI_API_KEY is no longer runtimeEditable (managed by accounts system)
+    const openai = ENV_VARS.find((v) => v.name === 'OPENAI_API_KEY');
+    assert.ok(openai, 'OPENAI_API_KEY should still be in registry');
+    assert.equal(openai.sensitive, true, 'OPENAI_API_KEY should remain sensitive');
+    assert.ok(!openai.runtimeEditable, 'OPENAI_API_KEY should not be runtimeEditable');
+  });
+
+  it('hasSensitiveEditableVars detects whitelisted sensitive vars', () => {
+    assert.ok(hasSensitiveEditableVars(['GITHUB_MCP_PAT']));
+    assert.ok(hasSensitiveEditableVars(['FRONTEND_URL', 'F102_API_KEY']));
+    assert.ok(!hasSensitiveEditableVars(['FRONTEND_URL', 'AUDIT_LOG_DIR']));
+    assert.ok(!hasSensitiveEditableVars(['OPENAI_API_KEY']), 'OPENAI_API_KEY is no longer editable (#340 P6)');
+  });
+
+  it('marks DEFAULT_OWNER_USER_ID as non-editable (trust anchor)', () => {
+    const def = ENV_VARS.find((v) => v.name === 'DEFAULT_OWNER_USER_ID');
+    assert.ok(def, 'DEFAULT_OWNER_USER_ID should be in registry');
+    assert.equal(def.runtimeEditable, false, 'trust anchor must not be editable from Hub');
   });
 });
 
@@ -231,6 +282,59 @@ describe('GET /api/config/env-summary (route)', () => {
 
     await app.close();
   });
+
+  // F212 Phase F (cloud codex R3 P2 on 3083d7c5f + R4 P2-#2 on fc69597675):
+  // env-summary.runtimeLogs MUST equal logger's CAPTURED LOG_DIR_PATH — not
+  // process.env.LOG_DIR read at request time. Runtime `PATCH /api/config/env` LOG_DIR
+  // edit would change process.env but pino destination is already bound to the
+  // captured path → users following the AC-F5 hint would grep an empty new directory.
+  it('AC-F5 (R3+R4): runtimeLogs equals logger captured LOG_DIR_PATH (single source of truth)', async () => {
+    const { configRoutes } = await import('../dist/routes/config.js');
+    const { LOG_DIR_PATH } = await import('../dist/infrastructure/logger.js');
+    const app = Fastify({ logger: false });
+    try {
+      await configRoutes(app);
+      await app.ready();
+      const res = await app.inject({ method: 'GET', url: '/api/config/env-summary' });
+      const body = JSON.parse(res.payload);
+      assert.equal(
+        body.paths.dataDirs.runtimeLogs,
+        LOG_DIR_PATH,
+        'runtimeLogs MUST equal logger LOG_DIR_PATH (R3+R4 single-source fix)',
+      );
+      assert.ok(body.paths.dataDirs.runtimeLogs.startsWith('/'), 'absolute path');
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('AC-F5 (R4 P2-#2): runtime process.env.LOG_DIR mutation MUST NOT change reported runtimeLogs', async () => {
+    const { configRoutes } = await import('../dist/routes/config.js');
+    const { LOG_DIR_PATH } = await import('../dist/infrastructure/logger.js');
+    // Mutate AFTER logger already captured (simulates runtime PATCH /api/config/env).
+    const mutatedPath = mkdtempSync(resolve(tmpdir(), 'cat-cafe-mutated-log-'));
+    setEnv('LOG_DIR', mutatedPath);
+    const app = Fastify({ logger: false });
+    try {
+      await configRoutes(app);
+      await app.ready();
+      const res = await app.inject({ method: 'GET', url: '/api/config/env-summary' });
+      const body = JSON.parse(res.payload);
+      assert.equal(
+        body.paths.dataDirs.runtimeLogs,
+        LOG_DIR_PATH,
+        'env-summary ignores runtime mutation — stays on captured logger path',
+      );
+      assert.notEqual(
+        body.paths.dataDirs.runtimeLogs,
+        mutatedPath,
+        'mutated env value MUST NOT propagate (R4 P2-#2 regression guard)',
+      );
+    } finally {
+      await app.close();
+      rmSync(mutatedPath, { recursive: true, force: true });
+    }
+  });
 });
 
 describe('PATCH /api/config/env (route)', () => {
@@ -357,11 +461,12 @@ describe('PATCH /api/config/env (route)', () => {
     }
   });
 
-  it('rejects sensitive env vars from hub writes', async () => {
+  it('rejects OPENAI_API_KEY env write since it is no longer runtimeEditable (#340 P6)', async () => {
     const { configRoutes } = await import('../dist/routes/config.js');
     const tempRoot = mkdtempSync(resolve(tmpdir(), 'cat-cafe-env-'));
     const envFilePath = resolve(tempRoot, '.env');
     writeFileSync(envFilePath, 'OPENAI_API_KEY=sk-old\n', 'utf8');
+    setEnv('DEFAULT_OWNER_USER_ID', undefined);
 
     const app = Fastify({ logger: false });
     try {
@@ -381,9 +486,8 @@ describe('PATCH /api/config/env (route)', () => {
         },
       });
 
+      // #340 P6: OPENAI_API_KEY is no longer runtimeEditable (managed by accounts system)
       assert.equal(res.statusCode, 400);
-      const body = JSON.parse(res.payload);
-      assert.match(body.error, /not editable/);
       assert.equal(readFileSync(envFilePath, 'utf8'), 'OPENAI_API_KEY=sk-old\n');
     } finally {
       await app.close();

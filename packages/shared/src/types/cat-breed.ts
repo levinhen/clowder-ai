@@ -7,7 +7,7 @@
  * Phase 4-F: 支持多 Variant（多版本猫召唤）
  */
 
-import type { CatColor, CatProvider } from './cat.js';
+import type { AgyProfileConfig, CatColor, ClientId } from './cat.js';
 import type { CatId } from './ids.js';
 import type { VoiceConfig } from './tts.js';
 
@@ -29,6 +29,8 @@ export interface ContextBudget {
 /**
  * CLI invocation config for a variant
  */
+import type { CliEffortValue } from '../cli-effort.js';
+
 export interface CliConfig {
   readonly command: string; // 'claude' | 'codex' | 'gemini'
   readonly outputFormat: string; // 'stream-json' | 'json'
@@ -39,7 +41,9 @@ export interface CliConfig {
    *   codex:  --config model_reasoning_effort="low|medium|high|xhigh"
    * Default: 'max' (claude) / 'xhigh' (codex)
    */
-  readonly effort?: 'low' | 'medium' | 'high' | 'max' | 'xhigh';
+  readonly effort?: CliEffortValue;
+  readonly contextWindow?: number;
+  readonly autoCompactTokenLimit?: number;
 }
 
 /**
@@ -62,10 +66,13 @@ export interface CatVariant {
   readonly mentionPatterns?: readonly string[];
   /** F127: member-side binding to a concrete account config (built-in or API key). */
   readonly accountRef?: string;
-  readonly provider: CatProvider;
+  /** clowder-ai#340 P5: CLI client identity (renamed from `provider`). */
+  readonly clientId: ClientId;
   readonly defaultModel: string;
   readonly mcpSupport: boolean;
   readonly cli: CliConfig;
+  /** F210 Phase G: optional isolated Antigravity CLI profile binding. */
+  readonly agyProfile?: AgyProfileConfig;
   /** F127: explicit CLI args for bridge-style members such as Antigravity. */
   readonly commandArgs?: readonly string[];
   /** Optional per-variant override for roleDescription; falls back to breed.roleDescription. */
@@ -86,9 +93,19 @@ export interface CatVariant {
   readonly teamStrengths?: string;
   /** F-Ground-3: Caution note. null = explicitly no caution (overrides breed). */
   readonly caution?: string | null;
+  /** F167 Phase E (KD-20): hard task restrictions — natural-language bans
+   *  (e.g. `["禁止写代码"]`). Surfaced to teammates via buildTeammateRoster
+   *  and to the cat itself via buildStaticIdentity. Data-driven replacement
+   *  for the retired L3 role-gate hardcoded regex. */
+  readonly restrictions?: readonly string[];
   /** F127: Extra CLI --config key=value pairs passed to the client at invocation time.
    *  Each entry is a raw config string, e.g. 'model_reasoning_effort="low"'. */
   readonly cliConfigArgs?: readonly string[];
+  /** clowder-ai#340 P5: Model provider name for api_key routing (renamed from `ocProviderName`).
+   *  e.g. "openrouter", "maas", "deepseek".
+   *  Used with api_key auth — runtime assembles `provider/defaultModel` for the -m flag
+   *  and generates an OPENCODE_CONFIG runtime config file for the provider. */
+  readonly provider?: string;
 }
 
 /**
@@ -99,7 +116,7 @@ export interface CatFeatures {
   /** F24: Enable session chain (context health tracking, auto-seal, bootstrap).
    *  Default: true. Set false for cats with inaccurate token stats (e.g. Gemini). */
   readonly sessionChain?: boolean;
-  /** F33 Phase 2: Per-breed session strategy override from cat-config.json.
+  /** F33 Phase 2: Per-breed session strategy override from the resolved runtime cat config.
    *  Partial config — merged with provider/global defaults at runtime.
    *  Matches SessionStrategyConfig shape (all fields except strategy are optional). */
   readonly sessionStrategy?: {
@@ -146,6 +163,9 @@ export interface CatBreed {
   readonly teamStrengths?: string;
   /** F-Ground-3: Caution note. null = explicitly no caution (overrides breed). */
   readonly caution?: string | null;
+  /** F167 Phase E (KD-20): breed-level hard restrictions; variants may override.
+   *  Natural-language bans (e.g. `["禁止生成图片"]`). */
+  readonly restrictions?: readonly string[];
 }
 
 // ── F032: Roster types for collaboration rules ─────────────────────────
@@ -185,6 +205,39 @@ export interface ReviewPolicy {
   readonly excludeUnavailable: boolean;
 }
 
+// ── F136 Phase 4: Account config types ──────────────────────────────────
+
+/** Protocol that the LLM endpoint speaks. */
+export type AccountProtocol = 'anthropic' | 'openai' | 'openai-responses' | 'google' | 'kimi';
+
+/**
+ * Account configuration — lives in ~/.cat-cafe/accounts.json (global).
+ * Maps an accountRef to its LLM endpoint metadata (no secrets).
+ */
+export interface AccountConfig {
+  readonly authType: 'oauth' | 'api_key';
+  /** F171: Explicit client identity for API key accounts (e.g. 'anthropic', 'openai'). */
+  readonly clientId?: string;
+  readonly baseUrl?: string;
+  readonly models?: readonly string[];
+  readonly displayName?: string;
+  /** F171: User-defined env vars injected into agent subprocess.
+   *  Keys starting with CAT_CAFE_ are reserved and cannot be overridden. */
+  readonly envVars?: Readonly<Record<string, string>>;
+}
+
+/**
+ * Credential entry — lives in ~/.cat-cafe/credentials.json (global keychain).
+ * HC-1: Object structure supporting both api_key and oauth token with TTL + refresh.
+ */
+export interface CredentialEntry {
+  readonly apiKey?: string;
+  readonly accessToken?: string;
+  readonly refreshToken?: string;
+  /** Token expiry as epoch milliseconds. */
+  readonly expiresAt?: number;
+}
+
 /**
  * Root config v1: breeds only (legacy)
  */
@@ -203,6 +256,8 @@ export interface CoCreatorConfig {
   readonly aliases: readonly string[];
   /** Line-start mention patterns for routing detection (e.g. ["@co-creator", "@co-creator"]) */
   readonly mentionPatterns: readonly string[];
+  /** IANA timezone used when injecting co-creator-local timestamps into cat prompts. */
+  readonly timeZone?: string;
   /** Optional co-creator avatar shown in Hub and chat surfaces. */
   readonly avatar?: string;
   /** Optional co-creator palette for Hub/chat surfaces. */
@@ -218,6 +273,12 @@ export interface CatCafeConfigV2 {
   readonly roster: Roster;
   readonly reviewPolicy: ReviewPolicy;
   readonly coCreator?: CoCreatorConfig;
+  /**
+   * @deprecated clowder-ai#340: Accounts moved to global ~/.cat-cafe/accounts.json.
+   * This field is only read during one-time migration (catalog → global).
+   * New code must use catalog-accounts.ts which reads the global file.
+   */
+  readonly accounts?: Readonly<Record<string, AccountConfig>>;
 }
 
 /**

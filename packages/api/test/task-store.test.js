@@ -115,6 +115,65 @@ describe('TaskStore', () => {
     });
   });
 
+  describe('upsertBySubject', () => {
+    it('re-registering a done pr_tracking task resets it back to todo', () => {
+      const original = store.upsertBySubject(
+        makeInput({
+          kind: 'pr_tracking',
+          subjectKey: 'pr:owner/repo#42',
+          title: 'PR tracking: owner/repo#42',
+        }),
+      );
+      store.update(original.id, { status: 'done' });
+
+      const reopened = store.upsertBySubject(
+        makeInput({
+          kind: 'pr_tracking',
+          subjectKey: 'pr:owner/repo#42',
+          threadId: 'thread-2',
+          title: 'PR tracking: owner/repo#42 (reopened)',
+        }),
+      );
+
+      assert.equal(reopened.id, original.id);
+      assert.equal(reopened.threadId, 'thread-2');
+      assert.equal(reopened.status, 'todo');
+    });
+
+    it('rejects cross-thread claims of legacy subject tasks when caller has a userId', () => {
+      const original = store.create(
+        makeInput({
+          kind: 'pr_tracking',
+          subjectKey: 'pr:owner/repo#43',
+          threadId: 'thread-owner',
+          title: 'Legacy PR tracking',
+          ownerCatId: 'opus',
+        }),
+      );
+
+      assert.throws(
+        () =>
+          store.upsertBySubject(
+            makeInput({
+              kind: 'pr_tracking',
+              subjectKey: 'pr:owner/repo#43',
+              threadId: 'thread-attacker',
+              title: 'Hijacked PR tracking',
+              ownerCatId: 'codex',
+              userId: 'user-attacker',
+            }),
+          ),
+        /already owned by another user/,
+      );
+
+      const entry = store.getBySubject('pr:owner/repo#43');
+      assert.equal(entry.id, original.id);
+      assert.equal(entry.threadId, 'thread-owner');
+      assert.equal(entry.ownerCatId, 'opus');
+      assert.equal(entry.userId, undefined);
+    });
+  });
+
   describe('delete', () => {
     it('deletes an existing task', () => {
       const task = store.create(makeInput());
@@ -145,6 +204,56 @@ describe('TaskStore', () => {
       assert.equal(store.get(tasks[0].id), null);
     });
 
+    it('does not evict active pr_tracking tasks during fallback oldest-task eviction', () => {
+      const tracker = store.upsertBySubject(
+        makeInput({
+          kind: 'pr_tracking',
+          subjectKey: 'pr:owner/repo#99',
+          title: 'Track owner/repo#99',
+        }),
+      );
+      const workTasks = [];
+      for (let i = 0; i < 4; i++) {
+        workTasks.push(store.create(makeInput({ title: `task-${i}` })));
+      }
+
+      store.create(makeInput({ title: 'new-task' }));
+
+      assert.equal(store.size, 5);
+      assert.equal(store.get(tracker.id)?.id, tracker.id);
+      assert.equal(store.getBySubject('pr:owner/repo#99')?.id, tracker.id);
+      assert.equal(store.get(workTasks[0].id), null);
+    });
+
+    it('preserves the task cap when every stored task is an active pr_tracking task', () => {
+      const trackers = [];
+      for (let i = 0; i < 5; i++) {
+        trackers.push(
+          store.upsertBySubject(
+            makeInput({
+              kind: 'pr_tracking',
+              subjectKey: `pr:owner/repo#${i}`,
+              title: `Track owner/repo#${i}`,
+            }),
+          ),
+        );
+      }
+
+      const replacement = store.upsertBySubject(
+        makeInput({
+          kind: 'pr_tracking',
+          subjectKey: 'pr:owner/repo#999',
+          title: 'Track owner/repo#999',
+        }),
+      );
+
+      assert.equal(store.size, 5);
+      assert.equal(store.get(trackers[0].id), null);
+      assert.equal(store.getBySubject('pr:owner/repo#0'), null);
+      assert.equal(store.get(replacement.id)?.id, replacement.id);
+      assert.equal(store.getBySubject('pr:owner/repo#999')?.id, replacement.id);
+    });
+
     it('evicts oldest task if no done tasks available', () => {
       // Fill to capacity (all todo)
       const tasks = [];
@@ -156,6 +265,68 @@ describe('TaskStore', () => {
       store.create(makeInput({ title: 'new-task' }));
       assert.equal(store.size, 5);
       assert.equal(store.get(tasks[0].id), null);
+    });
+  });
+
+  // --- F193 Phase E: dispatch gate ---
+
+  describe('dispatch gate (F193-E1)', () => {
+    it('persists relatedFeatureId when provided', () => {
+      const task = store.create(makeInput({ relatedFeatureId: 'F193' }));
+      assert.equal(task.relatedFeatureId, 'F193');
+      const retrieved = store.get(task.id);
+      assert.equal(retrieved.relatedFeatureId, 'F193');
+    });
+
+    it('persists detectedFeatureIds when provided', () => {
+      const task = store.create(makeInput({ detectedFeatureIds: ['F128', 'F193'] }));
+      assert.deepStrictEqual(task.detectedFeatureIds, ['F128', 'F193']);
+    });
+
+    it('persists dispatchGate with status missing', () => {
+      const gate = {
+        status: 'missing',
+        suggestedAction: {
+          type: 'cross_post',
+          featureId: 'F193',
+          reason: 'Task references F193',
+          source: 'dispatch_gate',
+        },
+      };
+      const task = store.create(makeInput({ dispatchGate: gate }));
+      assert.equal(task.dispatchGate.status, 'missing');
+      assert.equal(task.dispatchGate.suggestedAction.featureId, 'F193');
+      assert.equal(task.dispatchGate.suggestedAction.source, 'dispatch_gate');
+    });
+
+    it('persists dispatchGate with status dispatched', () => {
+      const gate = {
+        status: 'dispatched',
+        dispatchedThreadId: 'thread_f193',
+        dispatchedMessageId: 'msg-123',
+        decidedAt: Date.now(),
+      };
+      const task = store.create(makeInput({ dispatchGate: gate }));
+      assert.equal(task.dispatchGate.status, 'dispatched');
+      assert.equal(task.dispatchGate.dispatchedThreadId, 'thread_f193');
+    });
+
+    it('persists dispatchGate with status not_dispatched + reason', () => {
+      const gate = {
+        status: 'not_dispatched',
+        reason: 'Will fix in this thread as part of current scope',
+        decidedAt: Date.now(),
+      };
+      const task = store.create(makeInput({ dispatchGate: gate }));
+      assert.equal(task.dispatchGate.status, 'not_dispatched');
+      assert.equal(task.dispatchGate.reason, 'Will fix in this thread as part of current scope');
+    });
+
+    it('omits dispatch gate fields when not provided', () => {
+      const task = store.create(makeInput());
+      assert.equal(task.relatedFeatureId, undefined);
+      assert.equal(task.detectedFeatureIds, undefined);
+      assert.equal(task.dispatchGate, undefined);
     });
   });
 });

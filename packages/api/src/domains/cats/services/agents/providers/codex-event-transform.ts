@@ -1,5 +1,6 @@
 import type { CatId } from '@cat-cafe/shared';
 import type { AgentMessage } from '../../types.js';
+import { normalizeTaskStatus } from '../invocation/invoke-helpers.js';
 
 // F060: Allowed image MIME types and max base64 payload size (5 MB encoded ≈ 3.75 MB decoded)
 const IMAGE_MIME_WHITELIST = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp', 'image/svg+xml']);
@@ -56,7 +57,7 @@ export function transformCodexEvent(
         : [];
     const tasks = rawItems.map((t, i) => {
       const subject = typeof t.content === 'string' ? t.content : typeof t.text === 'string' ? t.text : '';
-      const status =
+      const rawStatus =
         typeof t.status === 'string'
           ? t.status
           : typeof t.completed === 'boolean'
@@ -67,7 +68,7 @@ export function transformCodexEvent(
       return {
         id: typeof t.id === 'string' ? t.id : `task-${i}`,
         subject: subject.slice(0, 120),
-        status,
+        status: normalizeTaskStatus(rawStatus),
       };
     });
     return {
@@ -89,13 +90,16 @@ export function transformCodexEvent(
         typeof item.arguments === 'object' && item.arguments !== null
           ? (item.arguments as Record<string, unknown>)
           : {};
-      return {
+      // F153 Phase J AC-J2: Codex uses item.id as the lifecycle anchor (no tool_call_id field).
+      const msg: AgentMessage = {
         type: 'tool_use',
         catId,
         toolName: `mcp:${server}/${tool}`,
         toolInput: args,
         timestamp: Date.now(),
       };
+      if (typeof item.id === 'string') msg.toolUseId = item.id;
+      return msg;
     }
 
     if (item?.type !== 'command_execution') return null;
@@ -180,12 +184,18 @@ export function transformCodexEvent(
     const textParts = typed.filter((c) => c.type === 'text' && typeof c.text === 'string').map((c) => c.text as string);
 
     const toolLabel = `mcp:${server}/${tool}`;
+    // F153 Phase J AC-J2: map Codex item.status → structured ToolResultStatus + carry item.id.
+    const toolResultStatus: 'ok' | 'error' | 'unknown' =
+      status === 'completed' ? 'ok' : status === 'failed' || status === 'error' ? 'error' : 'unknown';
     const toolResult: AgentMessage = {
       type: 'tool_result',
       catId,
       content: `${toolLabel} (${status})\n${textParts.join('\n')}`.trim(),
+      toolName: toolLabel,
+      toolResultStatus,
       timestamp: Date.now(),
     };
+    if (typeof item.id === 'string') toolResult.toolUseId = item.id;
 
     // F060: Extract image content blocks → media_gallery rich block
     // P2 fix: mimeType whitelist + base64 size guard

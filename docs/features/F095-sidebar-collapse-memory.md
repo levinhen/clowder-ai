@@ -4,15 +4,14 @@ related_features: []
 topics: [frontend, ux, sidebar, navigation]
 doc_kind: spec
 created: 2026-03-10
-completed: 2026-03-13
 status: done
 ---
 
 # F095: Thread Sidebar 导航体验升级
 
 > **Status**: done | **Owner**: Ragdoll | **Priority**: P1
-**Phase A~C completed: 2026-03-11** | **Phase D completed: 2026-03-12** | **Feature closed: 2026-03-13**
-**Implementation**: PR #366 / #370 / #373 / #376 / #378 / #380
+**Phase A~D completed: 2026-03-13** | **Phase E/F/G completed: 2026-03-27**
+**Implementation**: PR #366 / #370 / #373 / #376 / #378 / #380 / #779 / #2022
 
 ## Why
 
@@ -111,6 +110,32 @@ Phase C hotfix 加了确认弹窗 + 审计事件（PR #378），但确认弹窗�
 - 新增 ThreadStore.purge(id)（物理删除，仅回收站 30 天后或手动）
 - GET /api/threads 新增 `?deleted=true` 查询参数（回收站列表）
 
+### Phase E: 滚动位置稳定性（Bug Fix）✅
+
+活跃 thread 上浮重排时，用户当前浏览位置不应跳动。
+
+1. **scrollTop 保持**：thread 列表重排前记录 scrollTop，重排后恢复到相同视觉位置
+2. **用户浏览时延迟重排**：如果用户正在手动滚动（或最近 2s 内有滚动操作），defer 重排到用户静止后
+3. **当前查看位置锚定**：重排后，用户正在看的那块内容不移动
+
+### Phase F: Project Context Menu + 快速新建 ✅
+
+参考 Codex App 的项目管理体验（team lead截图 2026-03-27）。
+
+1. **Project 右键菜单**：在项目名称上右键（或长按/hover 出按钮）显示 context menu
+   - **Open in Finder**：打开项目对应的本地目录
+   - **Edit name**：inline 编辑项目显示名称（Enter 确认 / Esc 取消）
+   - **Archive threads**：归档该项目下所有 thread（复用 Phase D 软删除机制）
+2. **快速新建 Thread 按钮**：项目名称旁的小图标，点击在该项目下直接新建 thread（跳过项目选择步骤）
+
+### Phase G: 系统级 Thread 分类 + 删除保护 ✅
+
+IM Hub 连接器等系统级 thread 需要专属管理，不应丢到"未分类"。
+
+1. **系统级 Project 分类**：sidebar 新增"系统"分区（位于置顶区下方），IM Hub 连接器 thread 自动归入
+2. **系统 thread 标识**：thread metadata 新增 `systemLevel: boolean`，IM Hub 创建的 thread 自动标记
+3. **删除保护**：系统级 thread 不显示删除按钮；如需强制删除，要求打字输入 thread 名称确认（类似 GitHub 删除仓库的确认方式）
+
 ## Acceptance Criteria
 
 ### Phase A（折叠持久化 + 搜索可见性）
@@ -118,7 +143,7 @@ Phase C hotfix 加了确认弹窗 + 审计事件（PR #378），但确认弹窗�
 - [x] AC-A2: 多个分组可以各自独立记忆状态
 - [x] AC-A3: 首次访问（无 localStorage 记录）时保持默认全部折叠
 - [x] AC-A4: localStorage key 有命名空间前缀（如 `cat-cafe:sidebar:`），不与其他功能冲突
-- [x] AC-A5: 搜索时匹配 thread 所在分组强制展开（忽略折叠状态）
+- [x] AC-A5: 搜索时匹配 thread 所在分组自动展开（首次展开后手动折叠优先，PR #2022 修正）
 - [x] AC-A6: 切换 thread 时目标分组自动展开
 - [x] AC-A7: "全部展开/全部折叠"按钮可用
 
@@ -147,13 +172,32 @@ Phase C hotfix 加了确认弹窗 + 审计事件（PR #378），但确认弹窗�
 - [ ] AC-D6: deletedAt 超过 30 天的 thread 自动物理清理 — **延后**（需 cron 基建，team lead确认后续再做）
 - [x] AC-D7: 级联数据（messages/tasks/memory）在软删除期间保留，物理删除时才清除
 
+### Phase E（滚动位置稳定性）✅
+- [x] AC-E1: 活跃 thread 上浮重排时，用户当前滚动位置不发生跳动
+- [x] AC-E2: 用户正在手动滚动时，thread 列表不因重排打断浏览（锚定补偿机制）
+- [x] AC-E3: 重排完成后，用户正在看的内容仍在原位可见
+
+### Phase F（Project Context Menu + 快速新建）✅
+- [x] AC-F1: 项目名称右键显示 context menu（Open in Finder / Edit name / Archive threads）
+- [x] AC-F2: Open in Finder 打开项目本地目录
+- [x] AC-F3: Edit name 可 inline 编辑项目显示名称（Enter 确认 / Esc 取消）
+- [x] AC-F4: Archive threads 将项目下所有 thread 软删除（复用 Phase D 机制）
+- [x] AC-F5: 项目名称旁有快速新建 Thread 图标按钮
+- [x] AC-F6: 快速新建跳过项目选择，直接在目标项目下创建 thread
+
+### Phase G（系统级 Thread 分类 + 删除保护）✅
+- [x] AC-G1: Sidebar 有"系统"分区，IM Hub 连接器 thread 自动归入
+- [x] AC-G2: 系统级 thread 有视觉标识区分（图标/标签）
+- [x] AC-G3: 系统级 thread 删除需打字确认保护（GitHub 模式：按钮可见 + typed confirm）
+- [x] AC-G4: 后端强制保护：DELETE /api/threads/:id 对系统 thread 需 ?force=true
+
 ## 需求点 Checklist
 
 | ID | 需求点（team experience/转述） | AC 编号 | 验证方式 | 状态 |
 |----|---------------------------|---------|----------|------|
 | R1 | "能够记录我是不是展开或者默认折叠" | AC-A1~A4 | test + manual | [x] |
 | R2 | "默认折叠" | AC-A3 | test | [x] |
-| R3 | 搜到了但分组折叠看不到（Maine Coon发现） | AC-A5 | test | [x] |
+| R3 | 搜到了但分组折叠看不到（Maine Coon发现）；搜索态手动折叠不生效（team lead 2026-06-01 报告，PR #2022 修复） | AC-A5 | test | [x] |
 | R4 | "我想用的 cat cafe 在这么下面" | AC-B1~B5 | screenshot | [x] |
 | R5 | "如果后续我们有 20 个项目 50 个项目怎么办" | AC-B2~B7 | test + screenshot | [x] |
 | R6 | "我可以填写他的 thread 名字" | AC-C1 | test + manual | [x] |
@@ -162,6 +206,11 @@ Phase C hotfix 加了确认弹窗 + 审计事件（PR #378），但确认弹窗�
 | R9 | "新建的那个窗口可能需要大点" | AC-C4 | screenshot | [x] |
 | R10 | team lead误删 thread 不可恢复（沉痛教训） | AC-D1~D7 | test + manual | [x] |
 | R11 | "面向终态开发"——确认弹窗是脚手架，软删除才是终态 | AC-D1 | test | [x] |
+| R12 | "翻了半天之后你们一往上移我啥东西又没了"（滚动 bug） | AC-E1~E3 | manual | [x] |
+| R13 | Codex App 参考：Open in Finder / Edit name / Archive threads | AC-F1~F4 | manual | [x] |
+| R14 | Codex App 参考：项目旁快速新建 Thread 按钮 | AC-F5~F6 | manual | [x] |
+| R15 | "IM Hub 得在最左边收录到系统级的 thread 里面" | AC-G1~G2 | manual + test | [x] |
+| R16 | "系统级 thread 不能支持用户删除或者要打字确认" | AC-G3~G4 | manual + test | [x] |
 
 ### 覆盖检查
 - [x] 每个需求点都能映射到至少一个 AC

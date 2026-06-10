@@ -1,6 +1,6 @@
 import type { CatData } from '@/hooks/useCatData';
 import {
-  type ClientValue,
+  type ClientId,
   DEFAULT_ANTIGRAVITY_COMMAND_ARGS,
   type HubCatEditorFormState,
   normalizeMentionPattern,
@@ -18,7 +18,7 @@ function trimText(value: unknown): string {
  * Returns a hint string when the model does not follow "providerId/modelId" convention for opencode.
  * Advisory only — callers should display as a warning, not block submission.
  */
-export function hintModelFormatForClient(client: ClientValue, model: string): string | null {
+export function hintModelFormatForClient(client: ClientId, model: string): string | null {
   if (client !== 'opencode') return null;
   const trimmed = model.trim();
   const slashIndex = trimmed.indexOf('/');
@@ -30,9 +30,25 @@ export function hintModelFormatForClient(client: ClientValue, model: string): st
 export const validateModelFormatForClient = hintModelFormatForClient;
 
 function resolveFormAccountRef(form: HubCatEditorFormState): string {
-  return trimText(
-    form.accountRef ?? (form as HubCatEditorFormState & { providerProfileId?: string }).providerProfileId,
-  );
+  return trimText(form.accountRef);
+}
+
+function buildVoiceConfig(form: HubCatEditorFormState) {
+  const voice = trimText(form.voiceVoice);
+  const langCode = trimText(form.voiceLangCode);
+  if (!voice) return undefined;
+  if (!langCode) return undefined;
+  const speed = Number.parseFloat(form.voiceSpeed);
+  const temperature = Number.parseFloat(form.voiceTemperature);
+  return {
+    voice,
+    langCode,
+    ...(Number.isFinite(speed) && speed > 0 ? { speed } : {}),
+    ...(trimText(form.voiceRefAudio) ? { refAudio: trimText(form.voiceRefAudio) } : {}),
+    ...(trimText(form.voiceRefText) ? { refText: trimText(form.voiceRefText) } : {}),
+    ...(trimText(form.voiceInstruct) ? { instruct: trimText(form.voiceInstruct) } : {}),
+    ...(Number.isFinite(temperature) && temperature >= 0 ? { temperature } : {}),
+  };
 }
 
 export function buildContextBudget(form: HubCatEditorFormState) {
@@ -71,13 +87,24 @@ export function buildCatPayload(form: HubCatEditorFormState, cat?: CatData | nul
   const accountRefPatch =
     trimmedAccountRef.length > 0
       ? { accountRef: trimmedAccountRef }
-      : cat?.accountRef || cat?.providerProfileId
+      : cat?.accountRef
         ? { accountRef: null as null }
         : {};
   const mcpSupportPatch =
-    cat && form.client !== cat.provider ? { mcpSupport: defaultMcpSupportForClient(form.client) } : {};
+    cat && form.clientId !== cat.clientId ? { mcpSupport: defaultMcpSupportForClient(form.clientId) } : {};
+  const trimmedCliEffort = trimText(form.cliEffort);
+  const cliPatch =
+    trimmedCliEffort.length > 0
+      ? { cli: { effort: trimmedCliEffort } }
+      : cat?.cli?.effort
+        ? { cli: { effort: null as null } }
+        : {};
+  const voiceConfig = buildVoiceConfig(form);
+  const voiceConfigPatch: Record<string, unknown> =
+    voiceConfig !== undefined ? { voiceConfig } : cat?.voiceConfig ? { voiceConfig: null } : {};
   const common = {
     displayName,
+    variantLabel: trimText(form.variantLabel),
     nickname: trimText(form.nickname),
     avatar: trimText(form.avatar),
     color: {
@@ -94,14 +121,15 @@ export function buildCatPayload(form: HubCatEditorFormState, cat?: CatData | nul
     strengths: splitStrengthTags(form.strengths),
     sessionChain: form.sessionChain === 'true',
     ...contextBudgetPatch,
+    ...voiceConfigPatch,
   };
 
-  if (form.client === 'antigravity') {
+  if (form.clientId === 'antigravity') {
     const commandArgsSource = trimText(form.commandArgs) || DEFAULT_ANTIGRAVITY_COMMAND_ARGS;
     return {
       ...common,
       ...(cat ? { name: updateName } : { catId: trimText(form.catId), name: createName }),
-      client: 'antigravity' as const,
+      clientId: 'antigravity' as const,
       ...accountRefPatch,
       ...mcpSupportPatch,
       defaultModel: trimText(form.defaultModel),
@@ -112,10 +140,47 @@ export function buildCatPayload(form: HubCatEditorFormState, cat?: CatData | nul
   return {
     ...common,
     ...(cat ? { name: updateName } : { catId: trimText(form.catId), name: createName }),
-    client: form.client,
+    clientId: form.clientId,
     ...accountRefPatch,
     ...mcpSupportPatch,
+    ...cliPatch,
     defaultModel: trimText(form.defaultModel),
     cliConfigArgs: (form.cliConfigArgs ?? []).filter((arg) => arg.trim().length > 0),
+    ...(form.clientId === 'opencode' && trimText(form.provider)
+      ? { provider: trimText(form.provider) }
+      : cat?.provider
+        ? { provider: null as null }
+        : {}),
   };
+}
+
+function normalizeOptionalText(value: unknown): string | null {
+  const trimmed = trimText(value);
+  return trimmed.length > 0 ? trimmed : null;
+}
+
+export function buildCatPatchPayload(form: HubCatEditorFormState, cat: CatData) {
+  const payload = buildCatPayload(form, cat) as Record<string, unknown>;
+
+  if (form.clientId === cat.clientId) {
+    delete payload.clientId;
+  }
+  if (trimText(form.defaultModel) === trimText(cat.defaultModel)) {
+    delete payload.defaultModel;
+  }
+
+  const nextAccountRef = normalizeOptionalText(form.accountRef);
+  const currentAccountRef = normalizeOptionalText(cat.accountRef);
+  if (nextAccountRef === currentAccountRef) {
+    delete payload.accountRef;
+  }
+
+  const nextProvider =
+    form.clientId === 'opencode' && trimText(form.provider).length > 0 ? trimText(form.provider) : null;
+  const currentProvider = normalizeOptionalText(cat.provider);
+  if (nextProvider === currentProvider) {
+    delete payload.provider;
+  }
+
+  return payload;
 }

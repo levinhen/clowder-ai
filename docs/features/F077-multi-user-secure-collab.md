@@ -1,6 +1,6 @@
 ---
 feature_ids: [F077]
-related_features: [F044, F059, F074]
+related_features: [F044, F059, F074, F156]
 topics: [auth, oauth, multi-user, security, session, thread-acl, github]
 doc_kind: spec
 created: 2026-03-07
@@ -71,6 +71,14 @@ GitHub OAuth 认证 + Thread ACL + Redis Session，实现安全的多用户协�
 | R9 | Route audit 三级分类 | AC8 | test | [ ] |
 | R10 | 向后兼容（auth 可选） | AC9 | test | [ ] |
 | R11 | projectPath 沙盒（Agent 只在授权目录执行） | AC10 | test | [ ] |
+
+### Route Audit 已知越权实例（R9/AC8 — 已修复，留作同类模式参考）
+
+> 以下越权路由在 #786 sync review 中发现。**单用户部署下零实际风险**（系统仅一个 owner，无第二个用户可越权），多用户启用后为 P1。**已修复**，留作 R9 route audit 时的同类模式参考（owner / 默认大厅 public / 其余按 caller 索引校验，三态）。
+
+- **`GET /api/recall/events`**（`packages/api/src/routes/recall-metrics.ts`）：原守卫 `thread.createdBy !== 'system' && thread.createdBy !== userId` 把**所有** `createdBy === 'system'` 的 thread 当 public，任何登录用户可读其 recall events。
+  - **已修复**（Maine Coon GPT-5.5，2026-05-28 合入 main）：收紧为 `canAccessThread(thread, userId)`（owner + 默认大厅 `DEFAULT_THREAD_ID`）**或** `system thread 且在 caller thread 索引里`（`threadStore.list(userId)`）——非默认 system thread 不再无条件 public，对齐 Phase 1 What #8「默认公共大厅收口」。带 84 行 `recall-events-route.test.js` 覆盖。
+  - 溯源：clowder-ai #786 Maine Coon云端 review（2026-05-27）发现 → Maine Coon修复 → 本 PR 合入 cat-cafe main（真相源）。R9 route audit 实施其余路由时可参照此 owner / 默认大厅 / index 三态模式。
 
 ## Key Decisions
 

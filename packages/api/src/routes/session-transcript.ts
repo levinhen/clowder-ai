@@ -14,6 +14,7 @@ import { formatEventsChat, formatEventsHandoff } from '../domains/cats/services/
 import type { TranscriptReader } from '../domains/cats/services/session/TranscriptReader.js';
 import type { ISessionChainStore } from '../domains/cats/services/stores/ports/SessionChainStore.js';
 import type { IThreadStore } from '../domains/cats/services/stores/ports/ThreadStore.js';
+import { isSharedDefaultThread } from '../domains/guides/guide-state-access.js';
 import { resolveUserId } from '../utils/request-identity.js';
 
 const VALID_VIEWS = new Set(['raw', 'chat', 'handoff']);
@@ -36,6 +37,25 @@ const searchSchema = z.object({
   limit: z.coerce.number().int().min(1).max(200).optional(),
   scope: z.enum(['digests', 'transcripts', 'both']).optional(),
 });
+
+function checkCatIdAccess(request: { headers: Record<string, unknown> }, sessionCatId: string): string | null {
+  const callerCatId = request.headers['x-cat-id'] as string | undefined;
+  if (callerCatId && sessionCatId !== callerCatId) {
+    return 'Access denied: session belongs to a different cat';
+  }
+  return null;
+}
+
+function canAccessSessionThread(
+  thread: { id: string; createdBy: string; externalRuntimeAnchorState?: { userId: string } | undefined } | null,
+  session: { userId: string },
+  userId: string,
+): boolean {
+  if (!thread) return false;
+  if (thread.createdBy === userId) return true;
+  if (thread.externalRuntimeAnchorState?.userId === userId && session.userId === userId) return true;
+  return isSharedDefaultThread(thread) && session.userId === userId;
+}
 
 export async function sessionTranscriptRoutes(
   app: FastifyInstance,
@@ -61,9 +81,15 @@ export async function sessionTranscriptRoutes(
     }
 
     const thread = await threadStore.get(session.threadId);
-    if (!thread || thread.createdBy !== userId) {
+    if (!canAccessSessionThread(thread, session, userId)) {
       reply.status(403);
       return { error: 'Access denied' };
+    }
+
+    const callerCatIdErr = checkCatIdAccess(request, session.catId);
+    if (callerCatIdErr) {
+      reply.status(403);
+      return { error: callerCatIdErr };
     }
 
     const view = (request.query.view ?? 'raw') as string;
@@ -125,9 +151,15 @@ export async function sessionTranscriptRoutes(
     }
 
     const thread = await threadStore.get(session.threadId);
-    if (!thread || thread.createdBy !== userId) {
+    if (!canAccessSessionThread(thread, session, userId)) {
       reply.status(403);
       return { error: 'Access denied' };
+    }
+
+    const callerCatIdErr2 = checkCatIdAccess(request, session.catId);
+    if (callerCatIdErr2) {
+      reply.status(403);
+      return { error: callerCatIdErr2 };
     }
 
     const digest = await transcriptReader.readDigest(sessionId, session.threadId, session.catId);
@@ -155,9 +187,15 @@ export async function sessionTranscriptRoutes(
     }
 
     const thread = await threadStore.get(session.threadId);
-    if (!thread || thread.createdBy !== userId) {
+    if (!canAccessSessionThread(thread, session, userId)) {
       reply.status(403);
       return { error: 'Access denied' };
+    }
+
+    const callerCatIdErr3 = checkCatIdAccess(request, session.catId);
+    if (callerCatIdErr3) {
+      reply.status(403);
+      return { error: callerCatIdErr3 };
     }
 
     const events = await transcriptReader.readInvocationEvents(
@@ -199,7 +237,10 @@ export async function sessionTranscriptRoutes(
 
     const { q, cats, sessionIds, limit, scope } = parseResult.data;
 
-    const catsArr = cats?.split(',').filter(Boolean);
+    // P0a enforcement: when x-cat-id header is present, force-filter to caller's own sessions only
+    // Prevents game-playing cats from searching other cats' session content (KD-39)
+    const callerCatId = request.headers['x-cat-id'] as string | undefined;
+    const catsArr = callerCatId ? [callerCatId] : cats?.split(',').filter(Boolean);
     const sessionIdsArr = sessionIds?.split(',').filter(Boolean);
 
     const hits = await transcriptReader.search(threadId, q, {

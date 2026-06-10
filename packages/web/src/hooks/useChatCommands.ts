@@ -1,5 +1,6 @@
 'use client';
 
+import { useRouter } from 'next/navigation';
 import { useCallback, useMemo } from 'react';
 import { useCatData } from '@/hooks/useCatData';
 import { useChatStore } from '@/stores/chatStore';
@@ -17,7 +18,7 @@ export function isCommandInvocation(input: string, command: string): boolean {
 
 /** Format ConfigSnapshot into readable multi-line text for /config display */
 function formatConfigForDisplay(config: ConfigSnapshot): string {
-  const lines: string[] = ['[配置] Clowder AI Config', ''];
+  const lines: string[] = ['[配置] Clowder AI 运行配置', ''];
 
   // Per-cat budgets first (the actual limits used)
   if (config.perCatBudgets) {
@@ -83,8 +84,8 @@ function formatConfigForDisplay(config: ConfigSnapshot): string {
   if (config.cats) {
     lines.push('猫猫配置');
     for (const [id, cat] of Object.entries(config.cats)) {
-      const c = cat as { displayName: string; provider: string; model: string; mcpSupport: boolean };
-      lines.push(`  ${c.displayName} (${id}): ${c.provider}/${c.model} ${c.mcpSupport ? '[MCP]' : ''}`);
+      const c = cat as { displayName: string; clientId: string; model: string; mcpSupport: boolean };
+      lines.push(`  ${c.displayName} (${id}): ${c.clientId}/${c.model} ${c.mcpSupport ? '[MCP]' : ''}`);
     }
     lines.push('');
   }
@@ -124,6 +125,7 @@ function formatConfigForDisplay(config: ConfigSnapshot): string {
  * Returns true if the input was a command that was handled.
  */
 export function useChatCommands() {
+  const router = useRouter();
   const { addMessage } = useChatStore();
   const { cats } = useCatData();
 
@@ -163,19 +165,30 @@ export function useChatCommands() {
           timestamp: Date.now(),
         });
       };
-      // /help — open Hub to commands tab (F12)
+      // /help — show available commands as system message
       if (trimmed === '/help') {
-        useChatStore.getState().openHub('commands');
+        addMessage({
+          id: `help-${Date.now()}`,
+          type: 'system',
+          variant: 'info',
+          content: [
+            '**可用命令**',
+            '`/config set <key> <value>` — 热更新配置',
+            '`/config` — 打开设置页面',
+            '`/help` — 显示此帮助',
+          ].join('\n'),
+          timestamp: Date.now(),
+        });
         return true;
       }
 
-      // /config command — open hub or hot-update
+      // /config command — open settings or hot-update
       if (isCommandInvocation(trimmed, '/config')) {
         const configArgs = trimmed.slice('/config'.length).trim();
 
-        // /config (no args) — open Hub to system tab (F12)
+        // /config (no args) — navigate to Settings page
         if (!configArgs) {
-          useChatStore.getState().openHub('system');
+          router.push('/settings?s=system');
           return true;
         }
 

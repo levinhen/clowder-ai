@@ -1,8 +1,19 @@
+import {
+  builtinAccountFamilyForClient,
+  CLI_EFFORT_VALUES,
+  type CliEffortValue,
+  getCliEffortOptionsForProvider,
+  builtinAccountIdForClient as sharedBuiltinAccountIdForClient,
+} from '@cat-cafe/shared';
 import type { CatData } from '@/hooks/useCatData';
-import type { BuiltinAccountClient, ProfileItem } from './hub-provider-profiles.types';
+import { UNKNOWN_CAT_COLOR } from '@/lib/color-defaults';
+import type { BuiltinAccountClient, ProfileItem } from './hub-accounts.types';
 import type { CatStrategyEntry, StrategyType } from './hub-strategy-types';
 
-export type ClientValue = 'anthropic' | 'openai' | 'google' | 'dare' | 'opencode' | 'antigravity';
+/** clowder-ai#340 P5: Renamed from ClientValue → ClientId (aligned with shared type). */
+export type ClientId = 'anthropic' | 'openai' | 'google' | 'kimi' | 'dare' | 'opencode' | 'antigravity' | 'catagent';
+/** @deprecated clowder-ai#340: Use {@link ClientId} instead. */
+export type ClientValue = ClientId;
 export type SessionChainValue = 'true' | 'false';
 export type CodexSandboxMode = 'read-only' | 'workspace-write' | 'danger-full-access';
 export type CodexApprovalPolicy = 'untrusted' | 'on-failure' | 'on-request' | 'never';
@@ -12,6 +23,7 @@ export interface HubCatEditorFormState {
   catId: string;
   name: string;
   displayName: string;
+  variantLabel: string;
   nickname: string;
   avatar: string;
   colorPrimary: string;
@@ -22,24 +34,42 @@ export interface HubCatEditorFormState {
   teamStrengths: string;
   caution: string;
   strengths: string;
-  client: ClientValue;
+  clientId: ClientId;
   accountRef: string;
   defaultModel: string;
   commandArgs: string;
   cliConfigArgs: string[];
+  cliEffort: CliEffortValue | '';
+  /** clowder-ai#340 P5: Model provider name (renamed from ocProviderName). */
+  provider: string;
   sessionChain: SessionChainValue;
   maxPromptTokens: string;
   maxContextTokens: string;
   maxMessages: string;
   maxContentLengthPerMsg: string;
+  voiceVoice: string;
+  voiceLangCode: string;
+  voiceSpeed: string;
+  voiceRefAudio: string;
+  voiceRefText: string;
+  voiceInstruct: string;
+  voiceTemperature: string;
 }
 
 export interface HubCatEditorDraft {
-  client: ClientValue;
+  clientId: ClientId;
   accountRef?: string;
-  providerProfileId?: string;
   defaultModel: string;
   commandArgs?: string;
+  /** F171: template identity fields for bootcamp-guided cat creation */
+  templateName?: string;
+  templateNickname?: string;
+  templateAvatar?: string;
+  templateColorPrimary?: string;
+  templateColorSecondary?: string;
+  templateRoleDescription?: string;
+  templatePersonality?: string;
+  templateTeamStrengths?: string;
 }
 
 export interface StrategyFormState {
@@ -57,13 +87,15 @@ export interface CodexRuntimeSettings {
   authMode: CodexAuthMode;
 }
 
-export const CLIENT_OPTIONS: Array<{ value: ClientValue; label: string }> = [
+export const CLIENT_OPTIONS: Array<{ value: ClientId; label: string }> = [
   { value: 'anthropic', label: 'Claude' },
   { value: 'openai', label: 'Codex' },
   { value: 'google', label: 'Gemini' },
+  { value: 'kimi', label: 'Kimi' },
   { value: 'dare', label: 'Dare' },
   { value: 'opencode', label: 'OpenCode' },
   { value: 'antigravity', label: 'Antigravity' },
+  { value: 'catagent', label: 'CatAgent' },
 ];
 
 export const SESSION_CHAIN_OPTIONS: Array<{ value: SessionChainValue; label: string }> = [
@@ -98,6 +130,24 @@ export const CODEX_AUTH_MODE_OPTIONS: Array<{ value: CodexAuthMode; label: strin
 
 export const DEFAULT_ANTIGRAVITY_COMMAND_ARGS = '. --remote-debugging-port=9000';
 
+const GOOGLE_OWNED_DOMAINS = ['generativelanguage.googleapis.com', 'googleapis.com'];
+
+function isCliEffortValue(value: string | undefined): value is CliEffortValue {
+  return value !== undefined && CLI_EFFORT_VALUES.includes(value as CliEffortValue);
+}
+
+function optionalVoiceText(value: string | undefined): string {
+  return value == null ? '' : value;
+}
+
+function optionalVoiceNumberText(value: number | undefined): string {
+  return value == null ? '' : String(value);
+}
+
+export function getCliEffortOptionsForClient(client: ClientValue): readonly CliEffortValue[] | null {
+  return getCliEffortOptionsForProvider(client);
+}
+
 export function splitMentionPatterns(raw: string): string[] {
   return raw
     .split(/[\n,]+/)
@@ -109,6 +159,26 @@ export function normalizeMentionPattern(value: string): string {
   const trimmed = value.trim();
   if (!trimmed) return '';
   return trimmed.startsWith('@') ? trimmed : `@${trimmed}`;
+}
+
+export function deriveModelMentionPattern(model: string): string {
+  const modelId = model.trim().split('/').filter(Boolean).at(-1)?.trim();
+  if (!modelId) return '';
+  const alias = modelId
+    .replace(/^[@.]+/, '')
+    .replace(/\s+/g, '-')
+    .replace(/[^A-Za-z0-9_.-]+/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^[._-]+|[._-]+$/g, '');
+  return alias ? normalizeMentionPattern(alias) : '';
+}
+
+export function withDefaultModelMentionPattern(form: HubCatEditorFormState): HubCatEditorFormState {
+  const modelAlias = deriveModelMentionPattern(form.defaultModel);
+  if (!modelAlias) return form;
+  const aliases = splitMentionPatterns(form.mentionPatterns).map(normalizeMentionPattern).filter(Boolean);
+  if (aliases.length > 0) return form;
+  return { ...form, mentionPatterns: joinTags([modelAlias]) };
 }
 
 export function canonicalMentionPattern(catId: string): string {
@@ -173,91 +243,142 @@ export function splitStrengthTags(raw: string): string[] {
     .filter(Boolean);
 }
 
-function isBuiltinClient(client: ClientValue): client is BuiltinAccountClient {
+function isBuiltinClient(client: ClientId): client is BuiltinAccountClient {
   return (
-    client === 'anthropic' || client === 'openai' || client === 'google' || client === 'dare' || client === 'opencode'
+    client === 'anthropic' ||
+    client === 'openai' ||
+    client === 'google' ||
+    client === 'kimi' ||
+    client === 'dare' ||
+    client === 'opencode'
   );
 }
 
 function legacyProfileClient(profile: ProfileItem): BuiltinAccountClient | undefined {
-  if (profile.client) return profile.client;
+  if (profile.clientId) return profile.clientId;
   if (profile.oauthLikeClient === 'dare' || profile.oauthLikeClient === 'opencode') return profile.oauthLikeClient;
   const normalizedId = `${profile.id} ${profile.provider ?? ''} ${profile.displayName} ${profile.name}`.toLowerCase();
   if (normalizedId.includes('claude')) return 'anthropic';
   if (normalizedId.includes('codex')) return 'openai';
   if (normalizedId.includes('gemini')) return 'google';
+  if (normalizedId.includes('kimi') || normalizedId.includes('moonshot')) return 'kimi';
   if (normalizedId.includes('dare')) return 'dare';
   if (normalizedId.includes('opencode')) return 'opencode';
-  switch (profile.protocol) {
-    case 'anthropic':
-      return 'anthropic';
-    case 'openai':
-      return 'openai';
-    case 'google':
-      return 'google';
-    default:
-      return undefined;
+  return undefined;
+}
+
+function parseHostname(baseUrl: string | undefined): string | null {
+  if (!baseUrl) return null;
+  try {
+    return new URL(baseUrl).hostname.toLowerCase();
+  } catch {
+    return null;
   }
 }
 
-export function builtinAccountIdForClient(client: ClientValue): string | null {
-  if (!isBuiltinClient(client)) return null;
-  switch (client) {
-    case 'anthropic':
-      return 'claude';
-    case 'openai':
-      return 'codex';
-    case 'google':
-      return 'gemini';
-    case 'dare':
-      return 'dare';
-    case 'opencode':
-      return 'opencode';
-  }
+function isOfficialGoogleHostname(hostname: string): boolean {
+  return GOOGLE_OWNED_DOMAINS.some((domain) => hostname === domain || hostname.endsWith(`.${domain}`));
 }
 
-export function filterAccounts(client: ClientValue, profiles: ProfileItem[]): ProfileItem[] {
-  if (!isBuiltinClient(client)) return [];
+function isAllowedGoogleGatewayProfile(profile: ProfileItem): boolean {
+  if (profile.authType !== 'api_key') return false;
+  const hostname = parseHostname(profile.baseUrl);
+  return hostname !== null && !isOfficialGoogleHostname(hostname);
+}
+
+function resolveBuiltinClientFamily(client: ClientId): BuiltinAccountClient | null {
+  if (typeof builtinAccountFamilyForClient === 'function') {
+    const family = builtinAccountFamilyForClient(client);
+    if (family) return family;
+  }
+  if (isBuiltinClient(client)) return client;
+  if (client === 'catagent') return 'anthropic';
+  return null;
+}
+
+export function builtinAccountIdForClient(client: ClientId): string | null {
+  return sharedBuiltinAccountIdForClient(client);
+}
+
+export function filterAccounts(client: ClientId, profiles: ProfileItem[]): ProfileItem[] {
+  const effective = resolveBuiltinClientFamily(client);
+  if (!effective || !isBuiltinClient(effective)) return [];
   const builtinProfiles = profiles.filter(
-    (profile) => profile.authType !== 'api_key' && legacyProfileClient(profile) === client,
+    (profile) => profile.authType !== 'api_key' && legacyProfileClient(profile) === effective,
   );
-  // Gemini CLI only supports builtin Google auth — no API key profiles.
-  if (client === 'google') return builtinProfiles;
+  if (effective === 'google') {
+    const gatewayProfiles = profiles.filter(isAllowedGoogleGatewayProfile);
+    return [...builtinProfiles, ...gatewayProfiles.filter((profile) => !builtinProfiles.includes(profile))];
+  }
+  if (effective === 'kimi') {
+    const kimiApiProfiles = profiles.filter(
+      (profile) => profile.authType === 'api_key' && legacyProfileClient(profile) === 'kimi',
+    );
+    return [...builtinProfiles, ...kimiApiProfiles.filter((profile) => !builtinProfiles.includes(profile))];
+  }
   const apiKeyProfiles = profiles.filter((profile) => profile.authType === 'api_key');
   return [...builtinProfiles, ...apiKeyProfiles.filter((profile) => !builtinProfiles.includes(profile))];
 }
 
 export const filterProfiles = filterAccounts;
 
+export function autoSlug(name: string, currentId?: string): string {
+  const slug = name
+    .trim()
+    .toLowerCase()
+    .replace(/[\s_]+/g, '-')
+    .replace(/[^a-z0-9-]/g, '')
+    .replace(/^[^a-z]+/, '')
+    .replace(/-+$/, '')
+    .replace(/-{2,}/g, '-')
+    .slice(0, 40);
+  if (/^[a-z]/.test(slug)) return slug;
+  if (currentId && /^cat-[a-z0-9]+$/.test(currentId)) return currentId;
+  const rand = Math.random().toString(36).substring(2, 10);
+  return `cat-${rand}`;
+}
+
 export function initialState(cat?: CatData | null, draft?: HubCatEditorDraft | null): HubCatEditorFormState {
   const createDraft = !cat ? draft : null;
-  const catId = cat?.id ?? '';
-  const mentionPatterns = cat?.mentionPatterns ?? (catId ? [canonicalMentionPattern(catId)] : []);
+  const persistedCliEffort = cat?.cli?.effort;
+  const voiceConfig = cat?.voiceConfig;
+  const nameForCreate = createDraft?.templateName ?? '';
+  const catId = cat?.id ?? (nameForCreate ? autoSlug(nameForCreate) : '');
+  const mentionPatterns = cat?.mentionPatterns ?? [];
   return {
     catId,
-    name: cat?.name ?? cat?.displayName ?? '',
-    displayName: cat?.displayName ?? cat?.name ?? '',
-    nickname: cat?.nickname ?? '',
-    avatar: cat?.avatar ?? '',
-    colorPrimary: cat?.color.primary ?? '#9B7EBD',
-    colorSecondary: cat?.color.secondary ?? '#E8DFF5',
+    name: cat?.name ?? cat?.displayName ?? createDraft?.templateName ?? '',
+    displayName: cat?.displayName ?? cat?.name ?? createDraft?.templateName ?? '',
+    variantLabel: cat?.variantLabel ?? '',
+    nickname: cat?.nickname ?? createDraft?.templateNickname ?? '',
+    avatar: cat?.avatar ?? createDraft?.templateAvatar ?? '',
+    colorPrimary: cat?.color.primary ?? createDraft?.templateColorPrimary ?? UNKNOWN_CAT_COLOR.primary,
+    colorSecondary: cat?.color.secondary ?? createDraft?.templateColorSecondary ?? UNKNOWN_CAT_COLOR.secondary,
     mentionPatterns: joinTags(mentionPatterns),
-    roleDescription: cat?.roleDescription ?? '',
-    personality: cat?.personality ?? '',
-    teamStrengths: cat?.teamStrengths ?? '',
+    roleDescription: cat?.roleDescription ?? createDraft?.templateRoleDescription ?? '',
+    personality: cat?.personality ?? createDraft?.templatePersonality ?? '',
+    teamStrengths: cat?.teamStrengths ?? createDraft?.templateTeamStrengths ?? '',
     caution: cat?.caution ?? '',
     strengths: cat?.strengths?.join(', ') ?? '',
-    client: (cat?.provider as ClientValue | undefined) ?? createDraft?.client ?? 'anthropic',
-    accountRef:
-      cat?.accountRef ?? cat?.providerProfileId ?? createDraft?.accountRef ?? createDraft?.providerProfileId ?? '',
+    clientId: (cat?.clientId as ClientId | undefined) ?? createDraft?.clientId ?? 'anthropic',
+    accountRef: cat?.accountRef ?? createDraft?.accountRef ?? '',
     defaultModel: cat?.defaultModel ?? createDraft?.defaultModel ?? '',
     commandArgs: cat?.commandArgs?.join(' ') ?? createDraft?.commandArgs ?? '',
     cliConfigArgs: [...(cat?.cliConfigArgs ?? [])],
+    cliEffort: isCliEffortValue(persistedCliEffort) ? persistedCliEffort : '',
+    provider: cat?.provider ?? '',
     sessionChain: String(cat?.sessionChain ?? true) as SessionChainValue,
     maxPromptTokens: cat?.contextBudget ? String(cat.contextBudget.maxPromptTokens) : '',
     maxContextTokens: cat?.contextBudget ? String(cat.contextBudget.maxContextTokens) : '',
     maxMessages: cat?.contextBudget ? String(cat.contextBudget.maxMessages) : '',
     maxContentLengthPerMsg: cat?.contextBudget ? String(cat.contextBudget.maxContentLengthPerMsg) : '',
+    voiceVoice: optionalVoiceText(voiceConfig?.voice),
+    voiceLangCode: optionalVoiceText(voiceConfig?.langCode),
+    voiceSpeed: optionalVoiceNumberText(voiceConfig?.speed),
+    voiceRefAudio: optionalVoiceText(voiceConfig?.refAudio),
+    voiceRefText: optionalVoiceText(voiceConfig?.refText),
+    voiceInstruct: optionalVoiceText(voiceConfig?.instruct),
+    voiceTemperature: optionalVoiceNumberText(voiceConfig?.temperature),
   };
 }
 
@@ -332,6 +453,7 @@ export function buildCodexConfigPatches(
 // Extracted to hub-cat-editor.payload.ts:
 // buildCatPayload, buildContextBudget, hintModelFormatForClient, validateModelFormatForClient
 export {
+  buildCatPatchPayload,
   buildCatPayload,
   buildContextBudget,
   hintModelFormatForClient,

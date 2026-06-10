@@ -1,19 +1,59 @@
 'use client';
 
+import type { ConnectorSource } from '@cat-cafe/shared';
 import type { RichBlock, RichInteractiveBlock } from '@/stores/chat-types';
 import { AudioBlock } from './AudioBlock';
+import { CallbackAuthFailureBlock } from './CallbackAuthFailureBlock';
 import { CardBlock } from './CardBlock';
 import { ChecklistBlock } from './ChecklistBlock';
 import { DiffBlock } from './DiffBlock';
+import { FileBlock } from './FileBlock';
+import { FrustrationIssueCard, isFrustrationIssueCardBlock } from './FrustrationIssueCard';
+import { HandoffProposalCard, isHandoffProposalCardBlock } from './HandoffProposalCard';
 import { HtmlWidgetBlock } from './HtmlWidgetBlock';
 import { InteractiveBlock } from './InteractiveBlock';
 import { InteractiveBlockGroup } from './InteractiveBlockGroup';
 import { MediaGalleryBlock } from './MediaGalleryBlock';
+import { isProposalCardBlock, ProposalCard } from './ProposalCard';
 
-function RichBlockRenderer({ block, catId, messageId }: { block: RichBlock; catId?: string; messageId?: string }) {
+function RichBlockRenderer({
+  block,
+  catId,
+  messageId,
+  messageSource,
+}: {
+  block: RichBlock;
+  catId?: string;
+  messageId?: string;
+  messageSource?: ConnectorSource;
+}) {
   switch (block.kind) {
-    case 'card':
+    case 'card': {
+      // F128: proposal cards have dedicated approval-card renderer
+      if (isProposalCardBlock(block)) return <ProposalCard block={block} messageId={messageId} />;
+      // F225: cat-initiated session handoff cards get a dedicated approve/reject renderer that wires
+      // the buttons to /api/session-handoff/:id/approve|reject (else they fall through to inert CardBlock).
+      if (isHandoffProposalCardBlock(block)) return <HandoffProposalCard block={block} messageId={messageId} />;
+      // F222: frustration auto-issue cards with trusted provenance get dedicated renderer
+      if (isFrustrationIssueCardBlock(block, messageSource)) {
+        return <FrustrationIssueCard block={block} messageId={messageId} />;
+      }
+      // F174 D2b-1: cards tagged with meta.kind = 'callback_auth_failure' get the
+      // dedicated in-context observability renderer ("明厨亮灶" — entity carries its
+      // own state). Plain cards continue to use the default CardBlock.
+      //
+      // Cloud Codex P2 #1397: meta is opaque user-controllable data, so route
+      // ONLY when the message itself comes from a trusted source — the
+      // callback-auth connector. Otherwise a regular cat/user card with that
+      // meta.kind would spoof the system warning UI + the hide-similar button.
+      const metaKind = (block.meta as { kind?: string } | undefined)?.kind;
+      const isTrustedCallbackAuth =
+        metaKind === 'callback_auth_failure' && messageSource?.connector === 'callback-auth';
+      if (isTrustedCallbackAuth) {
+        return <CallbackAuthFailureBlock block={block} />;
+      }
       return <CardBlock block={block} messageId={messageId} />;
+    }
     case 'diff':
       return <DiffBlock block={block} />;
     case 'checklist':
@@ -26,9 +66,11 @@ function RichBlockRenderer({ block, catId, messageId }: { block: RichBlock; catI
       return <InteractiveBlock block={block} messageId={messageId} />;
     case 'html_widget':
       return <HtmlWidgetBlock block={block} />;
+    case 'file':
+      return <FileBlock block={block} />;
     default:
       return (
-        <div className="rounded-lg border border-gray-200 dark:border-gray-700 px-3 py-2 text-xs text-gray-400">
+        <div className="rounded-lg border border-cafe px-3 py-2 text-xs text-cafe-muted">
           未知富块类型: {(block as { kind: string }).kind}
         </div>
       );
@@ -114,7 +156,23 @@ function groupBlocks(blocks: RichBlock[]): ResultItem[] {
   return result;
 }
 
-export function RichBlocks({ blocks, catId, messageId }: { blocks: RichBlock[]; catId?: string; messageId?: string }) {
+export function RichBlocks({
+  blocks,
+  catId,
+  messageId,
+  messageSource,
+}: {
+  blocks: RichBlock[];
+  catId?: string;
+  messageId?: string;
+  /**
+   * F174 D2b-1 cloud P2 #1397: trusted-provenance gate for sub-renderers.
+   * The callback-auth-failure renderer requires `messageSource.connector ===
+   * 'callback-auth'` so a regular card with spoofed `meta.kind` can't pose
+   * as a system warning + trigger hide-similar. Other renderers ignore this.
+   */
+  messageSource?: ConnectorSource;
+}) {
   if (blocks.length === 0) return null;
   const items = groupBlocks(blocks);
   return (
@@ -123,7 +181,13 @@ export function RichBlocks({ blocks, catId, messageId }: { blocks: RichBlock[]; 
         'grouped' in item ? (
           <InteractiveBlockGroup key={item.groupId} blocks={item.blocks} messageId={messageId} />
         ) : (
-          <RichBlockRenderer key={item.id} block={item} catId={catId} messageId={messageId} />
+          <RichBlockRenderer
+            key={item.id}
+            block={item}
+            catId={catId}
+            messageId={messageId}
+            messageSource={messageSource}
+          />
         ),
       )}
     </div>

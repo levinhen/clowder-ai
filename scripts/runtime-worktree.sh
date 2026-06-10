@@ -2,9 +2,19 @@
 
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd -P)"
-PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd -P)"
-DEFAULT_RUNTIME_DIR="$(cd "$PROJECT_DIR/.." && pwd -P)/cat-cafe-runtime"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+# Quick-start build-freshness gate — rebuild when source moved, not just when
+# the artifact is missing (otherwise dist never refreshes across restarts).
+# Resolve via BASH_SOURCE, not $0/SCRIPT_DIR: under `source runtime-worktree.sh
+# --source-only` $0 is the parent shell, so SCRIPT_DIR mis-resolves to cwd.
+# BASH_SOURCE[0] always points at this file (source and exec alike).
+# shellcheck source=scripts/lib/quickstart-freshness.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/quickstart-freshness.sh"
+# shellcheck source=scripts/lib/node-runtime-guard.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/node-runtime-guard.sh"
+DEFAULT_RUNTIME_DIR="$(cd "$PROJECT_DIR/.." && pwd)/cat-cafe-runtime"
 
 RUNTIME_DIR="${CAT_CAFE_RUNTIME_DIR:-$DEFAULT_RUNTIME_DIR}"
 RUNTIME_BRANCH="${CAT_CAFE_RUNTIME_BRANCH:-runtime/main-sync}"
@@ -81,10 +91,6 @@ abs_path() {
   printf '%s/%s\n' "${dir%/}" "${base%/}"
 }
 
-normalize_runtime_dir() {
-  RUNTIME_DIR="$(abs_path "$RUNTIME_DIR")"
-}
-
 read_env_file_value() {
   local env_file="$1"
   local key="$2"
@@ -98,30 +104,10 @@ read_env_file_value() {
 }
 
 runtime_env_value() {
-  read_env_file_value "$RUNTIME_DIR/.env" "$1"
+  local runtime_dir
+  runtime_dir="$(abs_path "$RUNTIME_DIR")"
+  read_env_file_value "$runtime_dir/.env" "$1"
 }
-
-sync_runtime_env_files() {
-  [ -d "$RUNTIME_DIR" ] || return 0
-
-  local file source_file runtime_file
-  for file in .env .env.local; do
-    source_file="$PROJECT_DIR/$file"
-    runtime_file="$RUNTIME_DIR/$file"
-
-    if [ -f "$source_file" ]; then
-      if [ ! -f "$runtime_file" ] || ! cmp -s "$source_file" "$runtime_file"; then
-        cp "$source_file" "$runtime_file"
-        info "synced $file into runtime worktree"
-      fi
-    elif [ -f "$runtime_file" ]; then
-      rm -f "$runtime_file"
-      info "removed stale runtime $file (source file missing)"
-    fi
-  done
-}
-
-normalize_runtime_dir
 
 require_git_repo() {
   git -C "$PROJECT_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1 \
@@ -146,11 +132,59 @@ ensure_remote_exists() {
     || die "remote '$REMOTE_NAME' not found"
 }
 
+probe_port_with_lsof() {
+  local port="$1"
+  lsof -nP -iTCP:"$port" -sTCP:LISTEN -t >/dev/null 2>&1
+}
+
+probe_port_with_ss() {
+  local port="$1"
+  ss -ltn "( sport = :$port )" 2>/dev/null | awk 'NR > 1 { found = 1; exit } END { exit found ? 0 : 1 }'
+}
+
+probe_port_with_nc() {
+  local port="$1"
+  if command -v timeout >/dev/null 2>&1; then
+    timeout 1 nc -z 127.0.0.1 "$port" >/dev/null 2>&1 || timeout 1 nc -z localhost "$port" >/dev/null 2>&1
+  else
+    nc -z 127.0.0.1 "$port" >/dev/null 2>&1 || nc -z localhost "$port" >/dev/null 2>&1
+  fi
+}
+
+probe_port_with_dev_tcp() {
+  local port="$1"
+  local timeout_cmd=""
+  if command -v timeout >/dev/null 2>&1; then
+    timeout_cmd="timeout 1"
+  fi
+  ${timeout_cmd} bash -c 'exec 3<>/dev/tcp/127.0.0.1/$1' probe "$port" >/dev/null 2>&1 \
+    || ${timeout_cmd} bash -c 'exec 3<>/dev/tcp/localhost/$1' probe "$port" >/dev/null 2>&1
+}
+
+port_is_listening() {
+  local port="$1"
+
+  if command -v lsof >/dev/null 2>&1 && probe_port_with_lsof "$port"; then
+    return 0
+  fi
+  if command -v ss >/dev/null 2>&1 && probe_port_with_ss "$port"; then
+    return 0
+  fi
+  if command -v nc >/dev/null 2>&1 && probe_port_with_nc "$port"; then
+    return 0
+  fi
+  if probe_port_with_dev_tcp "$port"; then
+    return 0
+  fi
+
+  return 1
+}
+
 is_api_running() {
   local port
   port="$(runtime_env_value API_SERVER_PORT 2>/dev/null || true)"
   port="${port:-${API_SERVER_PORT:-3004}}"
-  lsof -nP -iTCP:"$port" -sTCP:LISTEN -t >/dev/null 2>&1
+  port_is_listening "$port"
 }
 
 start_arg_present() {
@@ -175,7 +209,30 @@ runtime_quick_mode() {
 
 install_runtime_dependencies() {
   info "runtime prerequisites missing; running pnpm install --frozen-lockfile"
-  pnpm -C "$RUNTIME_DIR" install --frozen-lockfile
+  # Always clear production env flags — Claude Code shell often has NODE_ENV=production,
+  # which causes pnpm to skip devDependencies and break builds.
+  env -u NODE_ENV -u npm_config_production -u NPM_CONFIG_PRODUCTION \
+    pnpm -C "$RUNTIME_DIR" install --frozen-lockfile
+}
+
+seed_runtime_config_from_project() {
+  local source_config="$PROJECT_DIR/.cat-cafe"
+  local target_config="$RUNTIME_DIR/.cat-cafe"
+  local file
+
+  [ "$RUNTIME_DIR" != "$PROJECT_DIR" ] || return 0
+  [ -d "$source_config" ] || return 0
+
+  for file in cat-catalog.json accounts.json credentials.json; do
+    [ -f "$source_config/$file" ] || continue
+    [ ! -e "$target_config/$file" ] || continue
+    mkdir -p "$target_config"
+    cp "$source_config/$file" "$target_config/$file"
+    if [ "$file" = "credentials.json" ]; then
+      chmod 600 "$target_config/$file" || true
+    fi
+    info "seeded runtime config: .cat-cafe/$file"
+  done
 }
 
 ensure_runtime_dependencies() {
@@ -204,19 +261,31 @@ ensure_runtime_dependencies() {
 ensure_quick_start_artifacts() {
   runtime_quick_mode || return 0
 
-  if [ ! -f "$RUNTIME_DIR/packages/shared/dist/index.js" ]; then
-    info "quick start missing shared dist; running pnpm -C \"$RUNTIME_DIR/packages/shared\" run build"
+  # Gate rebuilds on source freshness (git HEAD of the runtime worktree),
+  # not artifact existence — otherwise a synced source change never reaches
+  # the running process no matter how many times we restart.
+  local head_commit
+  head_commit="$(git -C "$RUNTIME_DIR" rev-parse HEAD 2>/dev/null || echo "")"
+
+  if needs_rebuild "$RUNTIME_DIR/packages/shared/dist/index.js" \
+      "$RUNTIME_DIR/packages/shared/dist/.build-commit" "$head_commit"; then
+    info "quick start: shared dist stale/missing; running pnpm -C \"$RUNTIME_DIR/packages/shared\" run build"
     pnpm -C "$RUNTIME_DIR/packages/shared" run build
+    record_build_stamp "$RUNTIME_DIR/packages/shared/dist/.build-commit" "$head_commit"
   fi
 
-  if [ ! -f "$RUNTIME_DIR/packages/mcp-server/dist/index.js" ]; then
-    info "quick start missing MCP server dist; running pnpm -C \"$RUNTIME_DIR/packages/mcp-server\" run build"
+  if needs_rebuild "$RUNTIME_DIR/packages/mcp-server/dist/index.js" \
+      "$RUNTIME_DIR/packages/mcp-server/dist/.build-commit" "$head_commit"; then
+    info "quick start: MCP server dist stale/missing; running pnpm -C \"$RUNTIME_DIR/packages/mcp-server\" run build"
     pnpm -C "$RUNTIME_DIR/packages/mcp-server" run build
+    record_build_stamp "$RUNTIME_DIR/packages/mcp-server/dist/.build-commit" "$head_commit"
   fi
 
-  if [ ! -f "$RUNTIME_DIR/packages/web/.next/BUILD_ID" ]; then
-    info "quick start missing web production build; running pnpm -C \"$RUNTIME_DIR/packages/web\" run build"
+  if needs_rebuild "$RUNTIME_DIR/packages/web/.next/BUILD_ID" \
+      "$RUNTIME_DIR/packages/web/.next/.build-commit" "$head_commit"; then
+    info "quick start: web production build stale/missing; running pnpm -C \"$RUNTIME_DIR/packages/web\" run build"
     pnpm -C "$RUNTIME_DIR/packages/web" run build
+    record_build_stamp "$RUNTIME_DIR/packages/web/.next/.build-commit" "$head_commit"
   fi
 }
 
@@ -244,6 +313,15 @@ ensure_runtime_clean() {
   local dirty
   dirty=$(git -C "$RUNTIME_DIR" status --short -uno 2>/dev/null || true)
   if [ -n "$dirty" ] && [ "$FORCE" != "true" ]; then
+    # Auto-stash isolated pnpm-lock.yaml drift (common after pnpm install on
+    # a previous run). Only the lock file dirty → safe to stash and proceed.
+    local drift_files
+    drift_files=$(git -C "$RUNTIME_DIR" diff HEAD --name-only 2>/dev/null || true)
+    if [ "$drift_files" = "pnpm-lock.yaml" ]; then
+      info "lock drift detected — stashing before sync"
+      git -C "$RUNTIME_DIR" stash push -m "lock-drift-pre-sync-stash" -- pnpm-lock.yaml
+      return 0
+    fi
     die "runtime worktree has local changes. Commit/stash first, or re-run with --force."
   fi
 }
@@ -286,10 +364,11 @@ init_runtime_worktree() {
 
   if [ "$RUN_INSTALL" = "true" ]; then
     info "installing dependencies in runtime worktree"
-    pnpm -C "$RUNTIME_DIR" install
+    env -u NODE_ENV -u npm_config_production -u NPM_CONFIG_PRODUCTION \
+      pnpm -C "$RUNTIME_DIR" install
   fi
 
-  sync_runtime_env_files
+  seed_runtime_config_from_project
 
   info "runtime worktree ready at $RUNTIME_DIR"
 }
@@ -308,11 +387,19 @@ sync_runtime_worktree() {
 
   info "syncing runtime worktree with $REMOTE_NAME/main (ff-only)"
   git -C "$RUNTIME_DIR" fetch "$REMOTE_NAME" main
-  git -C "$RUNTIME_DIR" merge --ff-only "$REMOTE_NAME/main"
+  if ! git -C "$RUNTIME_DIR" merge --ff-only "$REMOTE_NAME/main" 2>/dev/null; then
+    echo ""
+    echo "  ff-only merge failed — likely stale untracked files blocking the sync."
+    echo "  Check with:  git -C \"$RUNTIME_DIR\" status"
+    echo "  Quick fix:   git -C \"$RUNTIME_DIR\" clean -fd .claude/skills/"
+    echo ""
+    die "runtime sync failed (see above)"
+  fi
 
   if [ "$RUN_INSTALL" = "true" ]; then
     info "refreshing dependencies in runtime worktree"
-    pnpm -C "$RUNTIME_DIR" install
+    env -u NODE_ENV -u npm_config_production -u NPM_CONFIG_PRODUCTION \
+      pnpm -C "$RUNTIME_DIR" install
 
     # pnpm install can legitimately fix an incomplete lock file (e.g. a PR
     # added a dep to package.json but forgot to commit the lock update).
@@ -326,7 +413,7 @@ sync_runtime_worktree() {
     fi
   fi
 
-  sync_runtime_env_files
+  seed_runtime_config_from_project
 
   info "sync complete"
 }
@@ -357,21 +444,24 @@ status_runtime_worktree() {
 }
 
 start_runtime_worktree() {
+  info "preparing runtime worktree (checking ports, syncing origin/main...)"
+
   if ! is_git_repo; then
-    ensure_restart_authorized
     RUNTIME_DIR="$PROJECT_DIR"
+    ensure_restart_authorized
     ensure_runtime_start_prereqs
     info "running in-place (deployment mode): $PROJECT_DIR"
     cd "$PROJECT_DIR"
-    exec env CAT_CAFE_STRICT_PROFILE_DEFAULTS=1 CAT_CAFE_CONFIG_ROOT="${CAT_CAFE_CONFIG_ROOT:-$PROJECT_DIR}" ./scripts/start-dev.sh --prod-web --profile=opensource ${START_ARGS[@]+"${START_ARGS[@]}"}
+    # In-place deployment: binary == workspace == PROJECT_DIR
+    export CAT_CAFE_RUNTIME_ROOT="$PROJECT_DIR"
+    export CAT_CAFE_WORKSPACE_ROOT="${CAT_CAFE_WORKSPACE_ROOT:-$PROJECT_DIR}"
+    exec env CAT_CAFE_STRICT_PROFILE_DEFAULTS=1 ./scripts/start-dev.sh --prod-web --profile=opensource ${START_ARGS[@]+"${START_ARGS[@]}"}
   fi
 
   if ! worktree_exists; then
     info "runtime worktree missing; initializing first"
     init_runtime_worktree
   fi
-
-  sync_runtime_env_files
 
   # Runtime is single-instance infra; restarting an active API requires
   # explicit opt-in so accidental `pnpm start` in runtime sessions cannot
@@ -382,22 +472,34 @@ start_runtime_worktree() {
     if is_api_running && [ "$FORCE" != "true" ]; then
       info "API port is active; skip pre-start sync to avoid in-place hot swap."
       info "Run 'pnpm runtime:sync' after stop if you need latest origin/main."
+      seed_runtime_config_from_project
     else
       sync_runtime_worktree
     fi
+  else
+    seed_runtime_config_from_project
   fi
 
   ensure_runtime_start_prereqs
 
   info "starting production stack from runtime worktree: $RUNTIME_DIR"
   cd "$RUNTIME_DIR"
+  # F061 PR #1414 — separate runtime binary root from user workspace root so
+  # Antigravity MCP config command points at fresh runtime dist while
+  # ALLOWED_WORKSPACE_DIRS scopes Bengal's shell tools to the user's actual
+  # project (the main cat-cafe repo where they're editing code).
+  export CAT_CAFE_RUNTIME_ROOT="$RUNTIME_DIR"
+  export CAT_CAFE_WORKSPACE_ROOT="${CAT_CAFE_WORKSPACE_ROOT:-$PROJECT_DIR}"
+  info "exporting CAT_CAFE_RUNTIME_ROOT=$CAT_CAFE_RUNTIME_ROOT"
+  info "exporting CAT_CAFE_WORKSPACE_ROOT=$CAT_CAFE_WORKSPACE_ROOT"
   # Runtime = production: auto-inject --prod-web for PWA + Tailscale support.
-  # CAT_CAFE_CONFIG_ROOT points back to the source repo so platform-level
-  # config (.cat-cafe/provider-profiles.json etc.) is read from one place,
-  # not from the runtime worktree's separate pnpm-workspace root (#176).
   # Bash 3.2 + set -u: empty-array expansion can throw "unbound variable".
-  exec env CAT_CAFE_STRICT_PROFILE_DEFAULTS=1 CAT_CAFE_CONFIG_ROOT="${CAT_CAFE_CONFIG_ROOT:-$PROJECT_DIR}" ./scripts/start-dev.sh --prod-web --profile=opensource ${START_ARGS[@]+"${START_ARGS[@]}"}
+  exec env CAT_CAFE_STRICT_PROFILE_DEFAULTS=1 ./scripts/start-dev.sh --prod-web --profile=opensource ${START_ARGS[@]+"${START_ARGS[@]}"}
 }
+
+[[ "${1:-}" == "--source-only" ]] && { return 0 2>/dev/null; exit 0; }
+
+ensure_supported_node_runtime "$SCRIPT_DIR/runtime-worktree.sh" "$@"
 
 COMMAND="${1:-status}"
 shift || true

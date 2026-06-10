@@ -371,32 +371,32 @@ Tests: 939 (880 backend + 59 frontend), 0 fail`,
 export default function F11ReviewShowcase() {
   const { getCatById } = useCatData();
   return (
-    <div className="min-h-screen bg-gradient-to-b from-orange-50 to-white">
+    <div className="min-h-screen bg-gradient-to-b from-[var(--semantic-warning-surface)] to-[var(--cafe-surface-canvas)]">
       {/* Header */}
-      <div className="sticky top-0 z-10 bg-white/80 backdrop-blur-sm border-b border-orange-100 px-6 py-4">
+      <div className="sticky top-0 z-10 bg-cafe-surface/80 backdrop-blur-sm border-b border-[var(--semantic-warning-surface)] px-6 py-4">
         <div className="max-w-3xl mx-auto">
-          <h1 className="text-2xl font-bold text-gray-800">F11 Mode System Review 攻防录</h1>
-          <p className="text-sm text-gray-500 mt-1">布偶猫 vs 缅因猫 — 6 轮 code review，研发自闭环</p>
+          <h1 className="text-2xl font-bold text-cafe">F11 Mode System Review 攻防录</h1>
+          <p className="text-sm text-cafe-secondary mt-1">布偶猫 vs 缅因猫 — 6 轮 code review，研发自闭环</p>
         </div>
       </div>
 
       {/* Stats Bar */}
-      <div className="bg-orange-50 border-b border-orange-100 px-6 py-3">
+      <div className="bg-[var(--semantic-warning-surface)] border-b border-[var(--semantic-warning-surface)] px-6 py-3">
         <div className="max-w-3xl mx-auto flex gap-6 text-sm">
           <div className="flex items-center gap-2">
-            <span className="w-3 h-3 rounded-full bg-red-400"></span>
+            <span className="w-3 h-3 rounded-full bg-[var(--semantic-critical)]"></span>
             <span>P1: 8 个</span>
           </div>
           <div className="flex items-center gap-2">
-            <span className="w-3 h-3 rounded-full bg-yellow-400"></span>
+            <span className="w-3 h-3 rounded-full bg-[var(--semantic-warning)]"></span>
             <span>P2: 12 个</span>
           </div>
           <div className="flex items-center gap-2">
-            <span className="w-3 h-3 rounded-full bg-green-400"></span>
+            <span className="w-3 h-3 rounded-full bg-[var(--semantic-success)]"></span>
             <span>Tests: 904 → 939</span>
           </div>
           <div className="flex items-center gap-2">
-            <span className="w-3 h-3 rounded-full bg-blue-400"></span>
+            <span className="w-3 h-3 rounded-full bg-[var(--semantic-info)]"></span>
             <span>6 轮才放行</span>
           </div>
         </div>
@@ -410,9 +410,9 @@ export default function F11ReviewShowcase() {
       </div>
 
       {/* Footer */}
-      <div className="border-t border-gray-100 bg-gray-50 px-6 py-8">
-        <div className="max-w-3xl mx-auto text-center text-sm text-gray-500">
-          <p className="font-medium text-gray-700 mb-2">缅因猫审查方法论</p>
+      <div className="border-t border-cafe-subtle bg-cafe-surface-elevated px-6 py-8">
+        <div className="max-w-3xl mx-auto text-center text-sm text-cafe-secondary">
+          <p className="font-medium text-cafe-secondary mb-2">缅因猫审查方法论</p>
           <div className="flex flex-wrap justify-center gap-4">
             <span>不信摘要，只看代码</span>
             <span>•</span>

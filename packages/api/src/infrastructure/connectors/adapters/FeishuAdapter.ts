@@ -21,7 +21,7 @@ const execFileAsync = promisify(execFile);
 
 import * as lark from '@larksuiteoapi/node-sdk';
 import type { FastifyBaseLogger } from 'fastify';
-import type { MessageEnvelope } from '../ConnectorMessageFormatter.js';
+import { DEFAULT_QUICK_ACTIONS, type MessageEnvelope } from '../ConnectorMessageFormatter.js';
 import type { IStreamableOutboundAdapter } from '../OutboundDeliveryHook.js';
 import type { FeishuTokenManager } from './FeishuTokenManager.js';
 import { formatFeishuCard } from './feishu-card-formatter.js';
@@ -38,6 +38,12 @@ export interface FeishuInboundMessage {
   text: string;
   messageId: string;
   senderId: string;
+  /** F134: Display name resolved via Contact API (group chat) */
+  senderName?: string;
+  /** F134: 'p2p' for DM, 'group' for group chat */
+  chatType?: 'p2p' | 'group';
+  /** F134: Group chat name resolved via Chat API */
+  chatName?: string;
   attachments?: FeishuAttachment[];
 }
 
@@ -45,6 +51,8 @@ export interface FeishuCardAction {
   chatId: string;
   senderId: string;
   actionValue: Record<string, unknown>;
+  option?: string;
+  chatType?: 'p2p' | 'group';
 }
 
 export interface FeishuMediaPayload {
@@ -55,6 +63,8 @@ export interface FeishuMediaPayload {
   url?: string;
   /** Absolute filesystem path for upload (from mediaPathResolver) */
   absPath?: string;
+  /** Display name — used as file_name in Feishu upload and for file_type inference */
+  fileName?: string;
 }
 
 export interface FeishuAdapterOptions {
@@ -73,6 +83,12 @@ export class FeishuAdapter implements IStreamableOutboundAdapter {
     null;
   private editMessageFn: ((params: { messageId: string; content: string }) => Promise<unknown>) | null = null;
   private deleteMessageFn: ((params: { messageId: string }) => Promise<unknown>) | null = null;
+  private addReactionFn: ((params: { messageId: string; emojiType: string }) => Promise<unknown>) | null = null;
+  private botOpenId: string | null = null;
+  private static CACHE_TTL_MS = 30 * 60 * 1000;
+  private senderNameCache = new Map<string, { name: string; expiresAt: number }>();
+  private chatNameCache = new Map<string, { name: string; expiresAt: number }>();
+  private chatTypeCache = new Map<string, { chatType: 'p2p' | 'group'; expiresAt: number }>();
 
   constructor(appId: string, appSecret: string, log: FastifyBaseLogger, options?: FeishuAdapterOptions) {
     this.client = new lark.Client({
@@ -113,8 +129,9 @@ export class FeishuAdapter implements IStreamableOutboundAdapter {
 
   /**
    * Parse a Feishu event callback into an inbound message.
-   * Supports text, image, file, and audio message types.
-   * Returns null for group or unsupported events.
+   * Supports text, image, file, audio, and post message types.
+   * For group chats, only processes messages that @mention the bot.
+   * Returns null for unsupported events or group messages not mentioning bot.
    */
   parseEvent(eventBody: unknown): FeishuInboundMessage | null {
     if (!eventBody || typeof eventBody !== 'object') return null;
@@ -130,9 +147,20 @@ export class FeishuAdapter implements IStreamableOutboundAdapter {
     if (!message) return null;
 
     const msgType = message.message_type as string;
+    const chatType = message.chat_type as string;
 
-    // MVP: DM only (p2p)
-    if (message.chat_type !== 'p2p') return null;
+    if (chatType !== 'p2p' && chatType !== 'group') return null;
+
+    const mentions = (message.mentions as Array<Record<string, unknown>> | undefined) ?? [];
+    if (chatType === 'group') {
+      if (!this.botOpenId) return null;
+      const botMentioned = mentions.some((m) => {
+        if (m.key === '@_all') return false;
+        const mentionId = m.id as Record<string, unknown> | undefined;
+        return mentionId?.open_id === this.botOpenId;
+      });
+      if (!botMentioned) return null;
+    }
 
     // Extract sender
     const sender = event.sender as Record<string, unknown> | undefined;
@@ -142,6 +170,7 @@ export class FeishuAdapter implements IStreamableOutboundAdapter {
       chatId: message.chat_id as string,
       messageId: message.message_id as string,
       senderId: String(senderId ?? 'unknown'),
+      chatType: chatType as 'p2p' | 'group',
     };
 
     // Parse content JSON
@@ -152,11 +181,23 @@ export class FeishuAdapter implements IStreamableOutboundAdapter {
       return null;
     }
 
+    // Strip @bot placeholder from text in group chat (Feishu uses @_user_N tokens)
+    const stripBotMention = (text: string): string => {
+      if (chatType !== 'group') return text;
+      for (const m of mentions) {
+        const mentionId = m.id as Record<string, unknown> | undefined;
+        if (mentionId?.open_id === this.botOpenId && typeof m.key === 'string') {
+          text = text.replace(new RegExp(m.key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'), '');
+        }
+      }
+      return text.trim();
+    };
+
     switch (msgType) {
       case 'text': {
         const text = content.text;
         if (typeof text !== 'string') return null;
-        return { ...base, text };
+        return { ...base, text: stripBotMention(text) };
       }
       case 'image': {
         const imageKey = content.image_key as string;
@@ -184,12 +225,19 @@ export class FeishuAdapter implements IStreamableOutboundAdapter {
         };
       }
       case 'post': {
-        const locale =
-          (content as Record<string, unknown>).zh_cn ??
-          (content as Record<string, unknown>).en_us ??
-          (content as Record<string, unknown>).ja_jp;
-        if (!locale || typeof locale !== 'object') return null;
-        const loc = locale as { title?: string; content?: unknown[][] };
+        // Feishu sends post content in two formats:
+        // 1. Locale-wrapped: { zh_cn: { title, content }, en_us: ... }
+        // 2. Direct (no locale wrapper): { title, content: [[...]] }
+        const c = content as Record<string, unknown>;
+        const locale = c.zh_cn ?? c.en_us ?? c.ja_jp;
+        const resolved =
+          locale && typeof locale === 'object'
+            ? locale
+            : Array.isArray(c.content) // direct format — content is array of paragraphs
+              ? c
+              : null;
+        if (!resolved || typeof resolved !== 'object') return null;
+        const loc = resolved as { title?: string; content?: unknown[][] };
         const textParts: string[] = [];
         const attachments: FeishuAttachment[] = [];
         if (loc.title) textParts.push(loc.title);
@@ -202,7 +250,10 @@ export class FeishuAdapter implements IStreamableOutboundAdapter {
               if (n.tag === 'text' || n.tag === 'a') {
                 if (typeof n.text === 'string') paraTexts.push(n.text);
               } else if (n.tag === 'img' && typeof n.image_key === 'string') {
-                attachments.push({ type: 'image' as const, feishuKey: n.image_key as string });
+                attachments.push({
+                  type: 'image' as const,
+                  feishuKey: n.image_key as string,
+                });
               }
             }
             if (paraTexts.length > 0) textParts.push(paraTexts.join(''));
@@ -240,13 +291,19 @@ export class FeishuAdapter implements IStreamableOutboundAdapter {
 
     if (!operator || !action || !context) return null;
 
-    const actionValue = action.value as Record<string, unknown> | undefined;
-    if (!actionValue || typeof actionValue !== 'object') return null;
+    const actionValue = (action.value as Record<string, unknown> | undefined) ?? {};
+    const option = typeof action.option === 'string' ? action.option : undefined;
+    if (Object.keys(actionValue).length === 0 && !option) return null;
+
+    const rawChatType = context.open_chat_type as string | undefined;
+    const chatType = rawChatType === 'p2p' || rawChatType === 'group' ? rawChatType : undefined;
 
     return {
       chatId: context.open_chat_id as string,
       senderId: operator.open_id as string,
       actionValue,
+      option,
+      chatType,
     };
   }
 
@@ -287,7 +344,7 @@ export class FeishuAdapter implements IStreamableOutboundAdapter {
       return;
     }
     if (payload.absPath && this.tokenManager) {
-      const uploaded = await this.uploadToFeishu(payload.absPath, payload.type);
+      const uploaded = await this.uploadToFeishu(payload.absPath, payload.type, payload.fileName);
       if (uploaded) {
         await this.sendWithPlatformKey(externalChatId, { ...payload, ...uploaded });
         return;
@@ -301,7 +358,7 @@ export class FeishuAdapter implements IStreamableOutboundAdapter {
       const tempPath = await this.downloadToTempFile(payload.url);
       if (tempPath) {
         try {
-          const uploaded = await this.uploadToFeishu(tempPath, payload.type);
+          const uploaded = await this.uploadToFeishu(tempPath, payload.type, payload.fileName);
           if (uploaded) {
             await this.sendWithPlatformKey(externalChatId, { ...payload, ...uploaded });
             return;
@@ -340,6 +397,7 @@ export class FeishuAdapter implements IStreamableOutboundAdapter {
   private async uploadToFeishu(
     absPath: string,
     type: 'image' | 'file' | 'audio',
+    displayFileName?: string,
   ): Promise<{ imageKey?: string; fileKey?: string } | null> {
     const token = await this.tokenManager?.getTenantAccessToken();
     if (!token) {
@@ -367,7 +425,7 @@ export class FeishuAdapter implements IStreamableOutboundAdapter {
       }
     }
 
-    const originalFileName = absPath.split('/').pop() ?? 'file';
+    const originalFileName = displayFileName ?? absPath.split('/').pop() ?? 'file';
 
     try {
       return await this.uploadToFeishuInner(uploadPath, type, token, originalFileName);
@@ -406,7 +464,7 @@ export class FeishuAdapter implements IStreamableOutboundAdapter {
     }
 
     const fileName = originalFileName ?? absPath.split('/').pop() ?? 'file';
-    const fileType = type === 'audio' ? 'opus' : 'stream';
+    const fileType = type === 'audio' ? 'opus' : inferFeishuFileType(fileName);
     const uploadFileName = type === 'audio' ? fileName.replace(/\.\w+$/, '.opus') : fileName;
     form.append('file_type', fileType);
     form.append('file_name', uploadFileName);
@@ -501,8 +559,93 @@ export class FeishuAdapter implements IStreamableOutboundAdapter {
     }
   }
 
-  async sendReply(externalChatId: string, content: string): Promise<void> {
-    await this.sendLarkMessage(externalChatId, 'text', JSON.stringify({ text: content }));
+  setBotOpenId(openId: string): void {
+    this.botOpenId = openId;
+  }
+
+  getBotOpenId(): string | null {
+    return this.botOpenId;
+  }
+
+  async resolveSenderName(openId: string): Promise<string | undefined> {
+    const cached = this.senderNameCache.get(openId);
+    if (cached && cached.expiresAt > Date.now()) return cached.name;
+
+    const token = await this.tokenManager?.getTenantAccessToken();
+    if (!token) return undefined;
+    try {
+      const res = await (this.uploadFetchFn ?? globalThis.fetch)(
+        `https://open.feishu.cn/open-apis/contact/v3/users/${openId}?user_id_type=open_id`,
+        { headers: { Authorization: `Bearer ${token}` } },
+      );
+      if (!res.ok) return undefined;
+      const data = (await res.json()) as { data?: { user?: { name?: string } } };
+      const name = data?.data?.user?.name;
+      if (name) {
+        this.senderNameCache.set(openId, { name, expiresAt: Date.now() + FeishuAdapter.CACHE_TTL_MS });
+      }
+      return name;
+    } catch {
+      return undefined;
+    }
+  }
+
+  async resolveChatName(chatId: string): Promise<string | undefined> {
+    const cached = this.chatNameCache.get(chatId);
+    if (cached && cached.expiresAt > Date.now()) return cached.name;
+
+    const token = await this.tokenManager?.getTenantAccessToken();
+    if (!token) return undefined;
+    try {
+      const res = await (this.uploadFetchFn ?? globalThis.fetch)(
+        `https://open.feishu.cn/open-apis/im/v1/chats/${chatId}`,
+        { headers: { Authorization: `Bearer ${token}` } },
+      );
+      if (!res.ok) return undefined;
+      const data = (await res.json()) as { data?: { name?: string } };
+      const name = data?.data?.name;
+      if (name) {
+        this.chatNameCache.set(chatId, { name, expiresAt: Date.now() + FeishuAdapter.CACHE_TTL_MS });
+      }
+      return name;
+    } catch {
+      return undefined;
+    }
+  }
+
+  async resolveChatType(chatId: string): Promise<'p2p' | 'group' | undefined> {
+    const cached = this.chatTypeCache.get(chatId);
+    if (cached && cached.expiresAt > Date.now()) return cached.chatType;
+
+    try {
+      const token = await this.tokenManager?.getTenantAccessToken();
+      if (!token) return undefined;
+      const res = await (this.uploadFetchFn ?? globalThis.fetch)(
+        `https://open.feishu.cn/open-apis/im/v1/chats/${chatId}`,
+        { headers: { Authorization: `Bearer ${token}` } },
+      );
+      if (!res.ok) return undefined;
+      const data = (await res.json()) as { data?: { chat_mode?: string } };
+      const mode = data?.data?.chat_mode;
+      if (mode === 'p2p' || mode === 'group') {
+        this.chatTypeCache.set(chatId, { chatType: mode, expiresAt: Date.now() + FeishuAdapter.CACHE_TTL_MS });
+        return mode;
+      }
+      return undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  private prependAtMention(text: string, sender?: { id: string; name?: string }): string {
+    if (!sender) return text;
+    return `<at user_id="${sender.id}">${sender.name ?? '用户'}</at> ${text}`;
+  }
+
+  async sendReply(externalChatId: string, content: string, metadata?: Record<string, unknown>): Promise<void> {
+    const sender = (metadata as { replyToSender?: { id: string; name?: string } } | undefined)?.replyToSender;
+    const text = this.prependAtMention(content, sender);
+    await this.sendLarkMessage(externalChatId, 'text', JSON.stringify({ text }));
   }
 
   async sendRichMessage(
@@ -510,24 +653,53 @@ export class FeishuAdapter implements IStreamableOutboundAdapter {
     textContent: string,
     blocks: RichBlock[],
     catDisplayName: string,
+    metadata?: Record<string, unknown>,
   ): Promise<void> {
-    const card = formatFeishuCard(blocks, catDisplayName, textContent);
+    const sender = (metadata as { replyToSender?: { id: string; name?: string } } | undefined)?.replyToSender;
+    const text = this.prependAtMention(textContent, sender);
+    const card = formatFeishuCard(blocks, catDisplayName, text);
     await this.sendLarkMessage(externalChatId, 'interactive', JSON.stringify(card));
   }
 
-  async sendFormattedReply(externalChatId: string, envelope: MessageEnvelope): Promise<void> {
+  async sendFormattedReply(
+    externalChatId: string,
+    envelope: MessageEnvelope,
+    metadata?: Record<string, unknown>,
+  ): Promise<void> {
     const isCallback = envelope.origin === 'callback';
     const headerTitle = isCallback ? `📨 ${envelope.header} · 传话` : envelope.header;
     const headerTemplate = isCallback ? 'purple' : 'blue';
 
-    const elements: Array<{ tag: string; content?: string }> = [];
+    const sender = (metadata as { replyToSender?: { id: string; name?: string } } | undefined)?.replyToSender;
+    const atPrefix = sender ? `<at id=${sender.id}>${sender.name ?? '用户'}</at> ` : '';
+
+    const elements: Array<Record<string, unknown>> = [];
     if (envelope.subtitle) {
       elements.push({ tag: 'markdown', content: `**${envelope.subtitle}**` });
     }
-    elements.push({ tag: 'markdown', content: envelope.body });
+    elements.push({ tag: 'markdown', content: `${atPrefix}${envelope.body}` });
     if (envelope.footer) {
       elements.push({ tag: 'hr' });
       elements.push({ tag: 'markdown', content: envelope.footer });
+    }
+    const actions = envelope.cardActions?.length ? envelope.cardActions : DEFAULT_QUICK_ACTIONS;
+    if (actions.length) {
+      elements.push({ tag: 'hr' });
+      const options = actions.map((a) => {
+        const v = a.value as { cmd?: string; args?: string };
+        const optVal = v.cmd ? (v.args ? `${v.cmd} ${v.args}` : v.cmd) : JSON.stringify(a.value);
+        return { text: { tag: 'plain_text', content: a.label }, value: optVal };
+      });
+      elements.push({
+        tag: 'action',
+        actions: [
+          {
+            tag: 'select_static',
+            placeholder: { tag: 'plain_text', content: '选择操作...' },
+            options,
+          },
+        ],
+      });
     }
     const card = {
       header: {
@@ -590,6 +762,50 @@ export class FeishuAdapter implements IStreamableOutboundAdapter {
   }
 
   /**
+   * F157: Add an emoji reaction to a message (e.g. ❤️ on user's inbound message).
+   * Fire-and-forget — errors are logged but never thrown.
+   */
+  async addReaction(platformMessageId: string, emojiType: string): Promise<void> {
+    if (this.addReactionFn) {
+      await this.addReactionFn({ messageId: platformMessageId, emojiType });
+      return;
+    }
+    try {
+      await this.client.im.messageReaction.create({
+        path: { message_id: platformMessageId },
+        data: { reaction_type: { emoji_type: emojiType } },
+      });
+    } catch (err) {
+      this.log.warn({ err, platformMessageId, emojiType }, '[FeishuAdapter] addReaction failed (non-fatal)');
+    }
+  }
+
+  /**
+   * F157: Edit a streaming card to a minimal "✅ 已回复" completion state.
+   * Preferred over deleteMessage to avoid Feishu's "recalled" notification.
+   */
+  async finalizeStreamCard(_externalChatId: string, platformMessageId: string, catDisplayName: string): Promise<void> {
+    const card = {
+      config: { update_multi: true },
+      header: {
+        title: { tag: 'plain_text' as const, content: `✅ ${catDisplayName || '猫猫'}已回复` },
+        template: 'green' as const,
+      },
+      elements: [] as unknown[],
+    };
+
+    if (this.editMessageFn) {
+      await this.editMessageFn({ messageId: platformMessageId, content: JSON.stringify(card) });
+      return;
+    }
+
+    await this.client.im.message.patch({
+      path: { message_id: platformMessageId },
+      data: { content: JSON.stringify(card) },
+    });
+  }
+
+  /**
    * Test helper: inject a mock send function.
    * @internal
    */
@@ -614,6 +830,14 @@ export class FeishuAdapter implements IStreamableOutboundAdapter {
   }
 
   /**
+   * Test helper: inject a mock addReaction function.
+   * @internal
+   */
+  _injectAddReaction(fn: (params: { messageId: string; emojiType: string }) => Promise<unknown>): void {
+    this.addReactionFn = fn;
+  }
+
+  /**
    * Test helper: inject a FeishuTokenManager.
    * @internal
    */
@@ -628,6 +852,35 @@ export class FeishuAdapter implements IStreamableOutboundAdapter {
   _injectUploadFetch(fn: typeof fetch): void {
     this.uploadFetchFn = fn;
   }
+
+  /**
+   * Test helper: clear TTL caches.
+   * @internal
+   */
+  _clearCaches(): void {
+    this.senderNameCache.clear();
+    this.chatNameCache.clear();
+  }
+}
+
+/**
+ * Phase J: Map file extension to Feishu file_type for native preview.
+ * Feishu recognizes: pdf, doc, xls, ppt, mp4, opus, stream (catch-all).
+ */
+const FEISHU_EXT_TO_FILE_TYPE: Record<string, string> = {
+  pdf: 'pdf',
+  doc: 'doc',
+  docx: 'doc',
+  xls: 'xls',
+  xlsx: 'xls',
+  ppt: 'ppt',
+  pptx: 'ppt',
+  mp4: 'mp4',
+};
+
+export function inferFeishuFileType(fileName: string): string {
+  const ext = fileName.split('.').pop()?.toLowerCase() ?? '';
+  return FEISHU_EXT_TO_FILE_TYPE[ext] ?? 'stream';
 }
 
 /** Read a Node.js ReadStream into a Buffer. */

@@ -15,9 +15,15 @@
 import type { CatId } from '@cat-cafe/shared';
 import type { RedisClient } from '@cat-cafe/shared/utils';
 import { createModuleLogger } from '../../../../../infrastructure/logger.js';
-import type { AppendMessageInput, StoredMessage } from '../ports/MessageStore.js';
-import { DEFAULT_THREAD_ID, generateSortableId, isDelivered } from '../ports/MessageStore.js';
+import type { AppendMessageInput, StoredMessage, StreamMetadataAugmentInput } from '../ports/MessageStore.js';
+import {
+  applyStreamMetadataAugment,
+  DEFAULT_THREAD_ID,
+  generateSortableId,
+  isDelivered,
+} from '../ports/MessageStore.js';
 import { MessageKeys } from '../redis-keys/message-keys.js';
+import { isSystemUserMessage } from '../visibility.js';
 import {
   safeParseConnectorSource,
   safeParseContentBlocks,
@@ -25,12 +31,13 @@ import {
   safeParseMentions,
   safeParseMetadata,
   safeParseToolEvents,
+  serializeExtra,
 } from './redis-message-parsers.js';
 
 const log = createModuleLogger('redis-message-store');
 
 const DEFAULT_LIMIT = 50;
-const DEFAULT_TTL_SECONDS = 7 * 24 * 60 * 60; // 7 days
+const DEFAULT_TTL_SECONDS = 0; // persistent — set >0 via env to enable expiry
 
 export class RedisMessageStore {
   private readonly redis: RedisClient;
@@ -48,16 +55,23 @@ export class RedisMessageStore {
   ) {
     this.redis = redis;
     this.onAppend = options?.onAppend;
-    const ttl = options?.ttlSeconds;
-    if (ttl === undefined) {
-      this.ttlSeconds = DEFAULT_TTL_SECONDS;
-    } else if (!Number.isFinite(ttl)) {
-      this.ttlSeconds = DEFAULT_TTL_SECONDS;
-    } else if (ttl <= 0) {
+    const raw = options?.ttlSeconds ?? DEFAULT_TTL_SECONDS;
+    if (!Number.isFinite(raw) || raw <= 0) {
       this.ttlSeconds = null;
     } else {
-      this.ttlSeconds = Math.floor(ttl);
+      this.ttlSeconds = Math.floor(raw);
     }
+  }
+
+  /** Resolve ioredis keyPrefix (SCAN doesn't auto-apply it) */
+  private get keyPrefix(): string {
+    return (this.redis.options as { keyPrefix?: string }).keyPrefix ?? '';
+  }
+
+  /** Strip keyPrefix from a raw SCAN key for use with normal commands (which auto-prefix) */
+  private stripPrefix(rawKey: string): string {
+    const p = this.keyPrefix;
+    return p && rawKey.startsWith(p) ? rawKey.slice(p.length) : rawKey;
   }
 
   async append(msg: AppendMessageInput): Promise<StoredMessage> {
@@ -112,7 +126,7 @@ export class RedisMessageStore {
       contentBlocks: msg.contentBlocks ? JSON.stringify(msg.contentBlocks) : '',
       toolEvents: msg.toolEvents ? JSON.stringify(msg.toolEvents) : '',
       metadata: msg.metadata ? JSON.stringify(msg.metadata) : '',
-      extra: msg.extra ? JSON.stringify(msg.extra) : '',
+      extra: msg.extra ? serializeExtra(msg.extra) : '',
       mentions: JSON.stringify(msg.mentions),
       timestamp: String(msg.timestamp),
       ...(msg.thinking ? { thinking: msg.thinking } : {}),
@@ -214,8 +228,8 @@ export class RedisMessageStore {
       ...(deletedAt ? { deletedAt, deletedBy: data.deletedBy ?? '' } : {}),
       ...(data._tombstone === '1' ? { _tombstone: true as const } : {}),
       ...(data.thinking ? { thinking: data.thinking } : {}),
-      ...(data.origin === 'stream' || data.origin === 'callback'
-        ? { origin: data.origin as 'stream' | 'callback' }
+      ...(data.origin === 'stream' || data.origin === 'callback' || data.origin === 'briefing'
+        ? { origin: data.origin as 'stream' | 'callback' | 'briefing' }
         : {}),
       ...(data.visibility === 'whisper' ? { visibility: 'whisper' as const } : {}),
       ...(data.whisperTo ? { whisperTo: safeParseMentions(data.whisperTo) } : {}),
@@ -226,6 +240,56 @@ export class RedisMessageStore {
       ...(data.mentionsUser === '1' ? { mentionsUser: true } : {}),
       ...(data.replyTo ? { replyTo: data.replyTo } : {}),
     };
+  }
+
+  /** Scan all stored message hashes (Redis-only repair helper). */
+  async scanAll(): Promise<StoredMessage[]> {
+    const matchPattern = `${this.keyPrefix}${MessageKeys.detail('*')}`;
+    const messages: StoredMessage[] = [];
+    let cursor = '0';
+    do {
+      const [nextCursor, keys] = await this.redis.scan(cursor, 'MATCH', matchPattern, 'COUNT', 100);
+      cursor = nextCursor;
+      if (keys.length > 0) {
+        const pipeline = this.redis.pipeline();
+        for (const key of keys) {
+          pipeline.hgetall(this.stripPrefix(key));
+        }
+        const results = await pipeline.exec();
+        for (const entry of results ?? []) {
+          const [err, data] = entry!;
+          if (err || !data || typeof data !== 'object') continue;
+          const d = data as Record<string, string>;
+          if (!d.id) continue;
+          const msg = await this.getById(d.id);
+          if (msg) messages.push(msg);
+        }
+      }
+    } while (cursor !== '0');
+    return messages;
+  }
+
+  /** Reassign a message to a different userId and move user-timeline membership. */
+  async reassignUserId(id: string, nextUserId: string): Promise<StoredMessage | null> {
+    const msg = await this.getById(id);
+    if (!msg) return null;
+    if (msg.userId === nextUserId) return msg;
+
+    const oldUserKey = MessageKeys.user(msg.userId);
+    const newUserKey = MessageKeys.user(nextUserId);
+    const score = (await this.redis.zscore(oldUserKey, id)) ?? String(msg.deliveredAt ?? msg.timestamp);
+
+    const pipeline = this.redis.multi();
+    pipeline.hset(MessageKeys.detail(id), { userId: nextUserId });
+    pipeline.zrem(oldUserKey, id);
+    pipeline.zadd(newUserKey, score, id);
+    if (this.ttlSeconds !== null) {
+      pipeline.expire(newUserKey, this.ttlSeconds);
+    }
+    await pipeline.exec();
+
+    msg.userId = nextUserId;
+    return msg;
   }
 
   async getRecent(limit?: number, userId?: string): Promise<StoredMessage[]> {
@@ -372,7 +436,32 @@ export class RedisMessageStore {
   async getByThread(threadId: string, limit?: number, userId?: string): Promise<StoredMessage[]> {
     const n = limit ?? DEFAULT_LIMIT;
     const key = MessageKeys.thread(threadId);
-    return this.fetchDeliveredDesc(key, n, userId ? (m) => m.userId === userId : undefined);
+    return this.fetchDeliveredDesc(key, n, userId ? (m) => m.userId === userId || isSystemUserMessage(m) : undefined);
+  }
+
+  async getByThreadIncludingQueued(threadId: string, limit?: number, userId?: string): Promise<StoredMessage[]> {
+    const n = limit ?? DEFAULT_LIMIT;
+    const key = MessageKeys.thread(threadId);
+    const CHUNK = Math.max(n, 50);
+    const result: StoredMessage[] = [];
+    let offset = 0;
+
+    while (result.length < n) {
+      const ids = await this.redis.zrevrange(key, offset, offset + CHUNK - 1);
+      if (ids.length === 0) break;
+      const messages = await this.hydrateMessages(ids);
+      for (const msg of messages) {
+        if (msg.deletedAt) continue;
+        if (msg.deliveryStatus === 'canceled') continue;
+        if (userId && msg.userId !== userId && !isSystemUserMessage(msg)) continue;
+        result.push(msg);
+        if (result.length >= n) break;
+      }
+      if (ids.length < CHUNK) break;
+      offset += CHUNK;
+    }
+
+    return result.slice(0, n).reverse();
   }
 
   /**
@@ -423,7 +512,7 @@ export class RedisMessageStore {
     const messages = await this.hydrateMessages(ids, { includeDeleted: true });
     const delivered = messages.filter(isDelivered);
     if (!userId) return delivered;
-    return delivered.filter((m) => m.userId === userId);
+    return delivered.filter((m) => m.userId === userId || isSystemUserMessage(m));
   }
 
   async getByThreadBefore(
@@ -435,7 +524,7 @@ export class RedisMessageStore {
   ): Promise<StoredMessage[]> {
     const n = limit ?? DEFAULT_LIMIT;
     const key = MessageKeys.thread(threadId);
-    const userFilter = userId ? (m: StoredMessage) => m.userId === userId : undefined;
+    const userFilter = userId ? (m: StoredMessage) => m.userId === userId || isSystemUserMessage(m) : undefined;
 
     if (!beforeId) {
       // F117: Chunked desc scan — collect N delivered, scan until full or exhausted
@@ -690,13 +779,31 @@ export class RedisMessageStore {
     return count;
   }
 
-  /** F096: Update message extra data (for interactive block state persistence). */
+  /** F096: Update message extra data (merge semantics — preserves existing fields). */
   async updateExtra(id: string, extra: NonNullable<StoredMessage['extra']>): Promise<StoredMessage | null> {
     const msg = await this.getById(id);
     if (!msg) return null;
-    await this.redis.hset(MessageKeys.detail(id), { extra: JSON.stringify(extra) });
-    msg.extra = extra;
+    const merged = { ...msg.extra, ...extra };
+    await this.redis.hset(MessageKeys.detail(id), { extra: serializeExtra(merged) });
+    msg.extra = merged;
     return msg;
+  }
+
+  async augmentStreamMetadata(id: string, patch: StreamMetadataAugmentInput): Promise<StoredMessage | null> {
+    const msg = await this.getById(id);
+    if (!msg) return null;
+    const augmented = applyStreamMetadataAugment(msg, patch);
+    const fields: Record<string, string> = {};
+    if (patch.thinking && augmented.thinking) fields.thinking = augmented.thinking;
+    if (patch.metadata && augmented.metadata) fields.metadata = JSON.stringify(augmented.metadata);
+    if (patch.toolEvents?.length && augmented.toolEvents) fields.toolEvents = JSON.stringify(augmented.toolEvents);
+    if (patch.replyTo && augmented.replyTo) fields.replyTo = augmented.replyTo;
+    if (patch.mentionsUser && augmented.mentionsUser) fields.mentionsUser = '1';
+    if (patch.extra && augmented.extra) fields.extra = serializeExtra(augmented.extra);
+    if (Object.keys(fields).length > 0) {
+      await this.redis.hset(MessageKeys.detail(id), fields);
+    }
+    return augmented;
   }
 
   /** F098-D: Mark a queued message as delivered (set deliveredAt timestamp). */
@@ -728,6 +835,51 @@ export class RedisMessageStore {
     await this.redis.hset(MessageKeys.detail(id), { deliveryStatus: 'canceled' });
     msg.deliveryStatus = 'canceled';
     return msg;
+  }
+
+  /**
+   * Atomic content-dedup claim via SET NX PX. Returns true on first claim within the window,
+   * false if an identical claim is still live (concurrent or recent byte-identical post). This
+   * is the race-safe gate for the callback exact-duplicate scan.
+   */
+  async claimContentDedupKey(key: string, ttlMs: number): Promise<boolean> {
+    const claimed = await this.redis.set(
+      MessageKeys.contentDedup(key),
+      '1',
+      'PX',
+      Math.max(1, Math.floor(ttlMs)),
+      'NX',
+    );
+    return claimed === 'OK';
+  }
+
+  /**
+   * #697: Scan for message IDs matching a given deliveryStatus.
+   * Uses SCAN + pipeline HGET pattern (same as InvocationRecordStore.scanByStatus).
+   * Called by StartupReconciler to find orphaned queued messages after restart.
+   */
+  async scanByDeliveryStatus(status: string): Promise<string[]> {
+    const matchPattern = `${this.keyPrefix}${MessageKeys.detail('*')}`;
+    const ids: string[] = [];
+    let cursor = '0';
+    do {
+      const [nextCursor, keys] = await this.redis.scan(cursor, 'MATCH', matchPattern, 'COUNT', 200);
+      cursor = nextCursor;
+      if (keys.length > 0) {
+        const pipeline = this.redis.pipeline();
+        for (const key of keys) {
+          pipeline.hget(this.stripPrefix(key), 'deliveryStatus');
+        }
+        const results = await pipeline.exec();
+        for (let i = 0; i < keys.length; i++) {
+          const [err, val] = results?.[i] ?? [null, null];
+          if (!err && val === status) {
+            ids.push(this.stripPrefix(keys[i]!).replace(/^msg:/, ''));
+          }
+        }
+      }
+    } while (cursor !== '0');
+    return ids;
   }
 
   /** Hydrate message IDs into full StoredMessage objects */
@@ -770,7 +922,9 @@ export class RedisMessageStore {
         ...(deletedAt ? { deletedAt, deletedBy: d.deletedBy ?? '' } : {}),
         ...(d._tombstone === '1' ? { _tombstone: true as const } : {}),
         ...(d.thinking ? { thinking: d.thinking } : {}),
-        ...(d.origin === 'stream' || d.origin === 'callback' ? { origin: d.origin as 'stream' | 'callback' } : {}),
+        ...(d.origin === 'stream' || d.origin === 'callback' || d.origin === 'briefing'
+          ? { origin: d.origin as 'stream' | 'callback' | 'briefing' }
+          : {}),
         ...(d.visibility === 'whisper' ? { visibility: 'whisper' as const } : {}),
         ...(d.whisperTo ? { whisperTo: safeParseMentions(d.whisperTo) } : {}),
         ...(d.revealedAt ? { revealedAt: parseInt(d.revealedAt, 10) } : {}),

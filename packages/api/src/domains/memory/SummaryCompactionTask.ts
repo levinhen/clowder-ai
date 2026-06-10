@@ -1,5 +1,4 @@
 import type Database from 'better-sqlite3';
-import type { ScheduledTask } from '../../infrastructure/scheduler/types.js';
 import { hasHighValueSignal, SUMMARY_CONFIG } from './summary-config.js';
 
 interface SummaryStateRow {
@@ -51,46 +50,18 @@ export interface SummaryCompactionDeps {
       candidates?: unknown[];
     }>;
   } | null>;
+  /** Re-embed a thread after summary update (for semantic search). Optional — fail-open. */
+  reEmbed?: (anchor: string, text: string) => Promise<void>;
+  /** H-3: Submit durable candidate to MarkerQueue for knowledge emergence pipeline. Optional — fail-open. */
+  submitCandidate?: (candidate: {
+    kind: string;
+    title: string;
+    claim: string;
+    confidence: string;
+    threadId: string;
+  }) => Promise<void>;
   /** Logger */
   logger: { info: (msg: string) => void; error: (msg: string, err?: unknown) => void };
-}
-
-/**
- * Phase G: LSM-style summary compaction task.
- *
- * Runs periodically, checks eligibility for each thread, generates
- * abstractive summaries via Opus API, and writes to summary_segments + evidence_docs.
- */
-export function createSummaryCompactionTask(deps: SummaryCompactionDeps): ScheduledTask {
-  const config = SUMMARY_CONFIG;
-
-  return {
-    name: 'summary-compaction',
-    intervalMs: config.schedulerIntervalMs,
-    enabled: deps.enabled,
-
-    async execute() {
-      // P1 fix (砚砚 review): get ALL threads with pending work, then filter by
-      // full eligibility (quiet/cooldown/signal) BEFORE applying budget.
-      // Old code truncated to budget first, starving eligible threads behind ineligible ones.
-      const candidates = getEligibleThreads(deps.db, deps, config);
-      if (candidates.length === 0) return;
-
-      let processed = 0;
-      for (const state of candidates) {
-        if (processed >= config.perTickBudget) break;
-        try {
-          const didProcess = await processThread(state, deps, config);
-          if (didProcess) processed++;
-        } catch (err) {
-          deps.logger.error(`[summary-compaction] thread ${state.thread_id} failed`, err);
-        }
-      }
-      if (processed > 0) {
-        deps.logger.info(`[summary-compaction] processed ${processed}/${candidates.length} threads`);
-      }
-    },
-  };
 }
 
 /** Check eligibility rule (KD-43 unified): quietWindow AND (count OR tokens OR signal) AND (cooldown OR signal-bypass) */
@@ -132,18 +103,8 @@ function isEligible(
   return true;
 }
 
-function getEligibleThreads(
-  db: Database.Database,
-  _deps: SummaryCompactionDeps,
-  _config: typeof SUMMARY_CONFIG,
-): SummaryStateRow[] {
-  const rows = db.prepare('SELECT * FROM summary_state WHERE pending_message_count > 0').all() as SummaryStateRow[];
-  // Eligibility is checked per-thread in processThread to allow async lastActivity lookup
-  // Here we just return threads with pending work; full eligibility check happens in execute loop
-  return rows;
-}
-
-async function processThread(
+/** Exported for F139 SummaryCompactionTaskSpec to reuse per-thread processing */
+export async function processThread(
   state: SummaryStateRow,
   deps: SummaryCompactionDeps,
   config: typeof SUMMARY_CONFIG,
@@ -176,6 +137,8 @@ async function processThread(
   // Dual-write: INSERT segments + UPDATE evidence_docs
   const lastMsg = messages[messages.length - 1]!;
   const now = new Date().toISOString();
+  const mergedSummary = result.segments.map((s) => s.summary).join('\n\n');
+  const totalTokens = mergedSummary.length / 4;
 
   const insertSegment = deps.db.prepare(`
     INSERT INTO summary_segments
@@ -209,10 +172,7 @@ async function processThread(
       );
     }
 
-    // 2. UPDATE evidence_docs.summary (read model = merged summary from all segments)
-    const mergedSummary = result.segments.map((s) => s.summary).join('\n\n');
-    const totalTokens = mergedSummary.length / 4; // rough estimate
-
+    // 2. UPDATE evidence_docs.summary (read model)
     deps.db
       .prepare(
         `UPDATE evidence_docs SET summary = ?, source_hash = ?, updated_at = ?
@@ -238,6 +198,48 @@ async function processThread(
   });
 
   tx();
+
+  // Re-embed this thread with new abstractive summary (for semantic search)
+  if (deps.reEmbed) {
+    try {
+      const title =
+        (
+          deps.db.prepare('SELECT title FROM evidence_docs WHERE anchor = ?').get(`thread-${state.thread_id}`) as
+            | { title: string }
+            | undefined
+        )?.title ?? '';
+      await deps.reEmbed(`thread-${state.thread_id}`, `${title} ${mergedSummary}`);
+    } catch {
+      // fail-open
+    }
+  }
+
+  // H-3: Submit durable candidates to MarkerQueue for knowledge emergence pipeline
+  if (deps.submitCandidate) {
+    for (const seg of result.segments) {
+      const candidates = (seg.candidates ?? []) as Array<{
+        kind: string;
+        title: string;
+        claim: string;
+        confidence?: string;
+      }>;
+      for (const c of candidates) {
+        try {
+          await deps.submitCandidate({
+            kind: c.kind,
+            title: c.title,
+            claim: c.claim,
+            confidence: c.confidence ?? 'inferred',
+            threadId: state.thread_id,
+          });
+          deps.logger.info(`[summary-compaction] submitted candidate: [${c.kind}] ${c.title}`);
+        } catch (err) {
+          // fail-open: candidate submission failure doesn't block compaction
+          deps.logger.error(`[summary-compaction] submitCandidate failed for [${c.kind}] ${c.title}: ${err}`);
+        }
+      }
+    }
+  }
 
   // P1 R2 fix (砚砚 review): after compaction, check if there are STILL more messages
   // beyond the new watermark. If so, re-populate pending signal so the thread stays
