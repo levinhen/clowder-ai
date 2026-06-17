@@ -223,6 +223,34 @@ test('resolveCliSupervisorNodeArgs falls back to source ts file under tsx runtim
   }
 });
 
+test('resolveCliSupervisorNodeArgs drops API env-file execArgv from source ts fallback', async () => {
+  const tempDir = await mkdtemp(join(tmpdir(), 'cat-cafe-cli-supervisor-env-file-'));
+  try {
+    const utilsDir = join(tempDir, 'src', 'utils');
+    await mkdir(utilsDir, { recursive: true });
+    const cliSpawnPath = join(utilsDir, 'cli-spawn.ts');
+    const supervisorPath = join(utilsDir, 'cli-supervisor.ts');
+    await writeFile(cliSpawnPath, '');
+    await writeFile(supervisorPath, '');
+
+    const args = resolveCliSupervisorNodeArgs(pathToFileURL(cliSpawnPath).href, [
+      '--import',
+      'tsx',
+      '--env-file=.env',
+      '--env-file',
+      '.env.local',
+      '--env-file-if-exists=.env.development',
+      '--env-file-if-exists',
+      '.env.optional',
+      '--trace-warnings',
+    ]);
+
+    assert.deepEqual(args, ['--import', 'tsx', '--trace-warnings', supervisorPath]);
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+});
+
 test('resolveCliSupervisorNodeArgs prefers built js file when present', async () => {
   const tempDir = await mkdtemp(join(tmpdir(), 'cat-cafe-cli-supervisor-dist-'));
   try {
@@ -233,7 +261,13 @@ test('resolveCliSupervisorNodeArgs prefers built js file when present', async ()
     await writeFile(cliSpawnPath, '');
     await writeFile(supervisorPath, '');
 
-    const args = resolveCliSupervisorNodeArgs(pathToFileURL(cliSpawnPath).href, ['--import', 'tsx']);
+    const args = resolveCliSupervisorNodeArgs(pathToFileURL(cliSpawnPath).href, [
+      '--import',
+      'tsx',
+      '--env-file=.env',
+      '--env-file',
+      '.env.local',
+    ]);
 
     assert.deepEqual(args, [supervisorPath]);
   } finally {
@@ -1723,7 +1757,7 @@ test('F212 AC-A1: __cliError includes cliDiagnostics with reasonCode for known s
   assert.equal(err.cliDiagnostics.debugRef.invocationId, 'inv-A1');
 });
 
-test('F212 AC-A1: __cliError for unknown stderr has cliDiagnostics with no reasonCode/safeExcerpt', async () => {
+test('F212 AC-A1: __cliError for unknown stderr has cliDiagnostics with sanitized safeExcerpt (#857)', async () => {
   const proc = createMockProcess({ exitOnKill: false });
   const spawnFn = createMockSpawnFn(proc);
 
@@ -1737,7 +1771,9 @@ test('F212 AC-A1: __cliError for unknown stderr has cliDiagnostics with no reaso
   assert.ok(err);
   assert.ok(err.cliDiagnostics);
   assert.equal(err.cliDiagnostics.reasonCode, undefined);
-  assert.equal(err.cliDiagnostics.safeExcerpt, undefined);
+  // #857: unknown raw text now surfaced as sanitized safeExcerpt
+  assert.ok(err.cliDiagnostics.safeExcerpt, 'unknown stderr should produce safeExcerpt (#857)');
+  assert.equal(err.cliDiagnostics.excerptSource, 'unknown_raw');
   assert.match(err.cliDiagnostics.publicSummary, /未识别/);
 });
 

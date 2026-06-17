@@ -35,6 +35,7 @@ import { configEventBus } from './config/config-event-bus.js';
 import { resolveFrontendBaseUrl, resolveFrontendCorsOrigins } from './config/frontend-origin.js';
 import { initRuntimeOverrides } from './config/session-strategy-overrides.js';
 import { assertStorageReady } from './config/storage-guard.js';
+import type { CollaborationContinuityCapsuleV1 } from './domains/cats/services/agents/invocation/CollaborationContinuityCapsule.js';
 import { createTaskProgressStore } from './domains/cats/services/agents/invocation/createTaskProgressStore.js';
 import { InvocationQueue } from './domains/cats/services/agents/invocation/InvocationQueue.js';
 import {
@@ -47,6 +48,7 @@ import type {
   RouterLike,
 } from './domains/cats/services/agents/invocation/QueueProcessor.js';
 import { QueueProcessor } from './domains/cats/services/agents/invocation/QueueProcessor.js';
+import { SessionContinuationCoordinator } from './domains/cats/services/agents/invocation/SessionContinuationCoordinator.js';
 import {
   resolveAcpBootstrapArgs,
   resolveAcpBootstrapCommand,
@@ -239,7 +241,9 @@ import { marketplaceRoutes } from './routes/marketplace.js';
 import { previewRoutes } from './routes/preview.js';
 import { terminalRoutes } from './routes/terminal.js';
 import { threadExportRoutes } from './routes/thread-export.js';
+import { threadMemberStrategyRoutes } from './routes/thread-member-strategy.js';
 import { ApiInstanceLease, type ApiInstanceLeaseInvalidation } from './services/ApiInstanceLease.js';
+import { resolveMemoryRepoPaths } from './utils/memory-root.js';
 import { findMonorepoRoot } from './utils/monorepo-root.js';
 import { resolveUserId } from './utils/request-identity.js';
 import { getDefaultUploadDir } from './utils/upload-paths.js';
@@ -475,6 +479,8 @@ async function main(): Promise<void> {
   }
   const storageResult = assertStorageReady(!!redis);
   app.log.info(`[api] Storage mode: ${storageResult.mode}`);
+  const { systemStatusRoutes } = await import('./routes/system-status.js');
+  await app.register(systemStatusRoutes, { storageMode: storageResult.mode });
 
   // F102 KD-34: append listener placeholder (wired after memoryServices init)
   let appendListener: ((msg: { id: string; threadId: string; timestamp: number; content: string }) => void) | null =
@@ -596,14 +602,8 @@ async function main(): Promise<void> {
   );
 
   // F102: Memory services — SQLite-only
-  // P1 fix: resolve paths relative to repo root, not CWD (which may be packages/api)
-  const { existsSync } = await import('node:fs');
   const { resolve } = await import('node:path');
-  const repoRoot = existsSync(resolve(process.cwd(), 'docs', 'features'))
-    ? process.cwd()
-    : existsSync(resolve(process.cwd(), '..', '..', 'docs', 'features'))
-      ? resolve(process.cwd(), '..', '..')
-      : process.cwd();
+  const { repoRoot, docsRoot, markersDir } = resolveMemoryRepoPaths(process.cwd());
 
   const { initRepoIdentity, isSameRepo } = await import('./utils/is-same-repo.js');
   initRepoIdentity(repoRoot);
@@ -634,8 +634,8 @@ async function main(): Promise<void> {
   const memoryServices = await createMemoryServices({
     type: 'sqlite',
     sqlitePath: process.env.EVIDENCE_DB ?? resolve(repoRoot, 'evidence.sqlite'),
-    docsRoot: process.env.DOCS_ROOT ?? resolve(repoRoot, 'docs'),
-    markersDir: resolve(repoRoot, 'docs', 'markers'),
+    docsRoot,
+    markersDir,
     transcriptDataDir, // reuse the same resolved path as Writer/Reader (line 282)
     embed: { embedMode: resolvedEmbedMode },
     // Phase E-2: message passage indexing — provide a callback that reads thread messages
@@ -1386,6 +1386,29 @@ async function main(): Promise<void> {
 
   // F39: Message queue delivery
   const invocationQueue = new InvocationQueue();
+  const sessionContinuationCoordinator = new SessionContinuationCoordinator({
+    threadStore: {
+      getMemberSessionStrategy: async (threadId, catId, userId) => {
+        if (threadStore.getMemberSessionStrategy) {
+          return (await threadStore.getMemberSessionStrategy(threadId, catId, userId)) ?? undefined;
+        }
+        if (threadStore.isRebornSession && (await threadStore.isRebornSession(threadId, catId))) {
+          return 'reborn';
+        }
+        return undefined;
+      },
+      consumePendingContinuation: async (threadId, catId, userId) => {
+        const entry = await threadStore.consumePendingContinuation(threadId, catId, userId);
+        return (entry?.capsule as unknown as CollaborationContinuityCapsuleV1 | undefined) ?? null;
+      },
+      setPendingContinuation: async (threadId, catId, userId, capsule) => {
+        await threadStore.setPendingContinuation(threadId, catId, userId, {
+          capsule: capsule as unknown as Record<string, unknown>,
+          createdAt: Date.now(),
+        });
+      },
+    },
+  });
   const queueProcessor = new QueueProcessor({
     queue: invocationQueue,
     invocationTracker,
@@ -1394,6 +1417,9 @@ async function main(): Promise<void> {
     socketManager,
     messageStore,
     log: app.log,
+    threadStore:
+      threadStore as unknown as import('./domains/cats/services/agents/invocation/QueueProcessor.js').ThreadStoreLike,
+    sessionContinuationCoordinator,
   });
   socketManager.setQueueProcessor(queueProcessor);
 
@@ -1456,6 +1482,7 @@ async function main(): Promise<void> {
     draftStore,
     invocationQueue,
     queueProcessor,
+    sessionContinuationCoordinator,
     taskProgressStore, // F194 AC-B7: cleared on zombie reconcile
     ...(f101GameStore ? { gameStore: f101GameStore } : {}),
     ...(f101SharedDriver ? { autoPlayer: f101SharedDriver } : {}),
@@ -1679,7 +1706,7 @@ async function main(): Promise<void> {
       evidenceDb: memoryServices.store.getDb(),
       markersProvider: memoryServices.markerQueue,
       repoRoot,
-      docsRoot: process.env.DOCS_ROOT ?? resolve(repoRoot, 'docs'),
+      docsRoot,
     });
     verdictGenerators['eval:memory'] = createMemoryGeneratorAdapter(memProvider);
   }
@@ -2239,6 +2266,7 @@ async function main(): Promise<void> {
     socketManager,
   });
   await app.register(threadExportRoutes, { threadStore });
+  await app.register(threadMemberStrategyRoutes, { threadStore }); // #921
   // F192: Shared callback — record proposal rejection as task outcome A2 signal.
   // Covers both F128 (thread proposal) and F225 (session handoff proposal) rejections.
   const onProposalReject = (input: {
@@ -2611,7 +2639,7 @@ async function main(): Promise<void> {
     knowledgeResolver: memoryServices.knowledgeResolver,
     markerQueue: memoryServices.markerQueue,
     repoRoot,
-    docsRoot: process.env.DOCS_ROOT ?? resolve(repoRoot, 'docs'),
+    docsRoot,
   });
 
   // F152 Phase C: Distillation routes (global lesson reflow)
@@ -2675,7 +2703,7 @@ async function main(): Promise<void> {
       ...(redisClient ? { redis: redisClient } : {}),
       // AC-H1 P1 R3: runtime exclude updates for parent IndexBuilder
       indexBuilder: memoryServices.indexBuilder as import('./domains/memory/IndexBuilder.js').IndexBuilder | undefined,
-      parentRoot: process.env.DOCS_ROOT ?? resolve(repoRoot, 'docs'),
+      parentRoot: docsRoot,
     });
   }
 
@@ -3534,7 +3562,13 @@ async function main(): Promise<void> {
     invokeTrigger,
     socketManager,
     defaultUserId: 'default-user' as const,
-    defaultCatId: 'opus' as CatId,
+    // clowder-ai#910 + cloud P1: pass a getter (not a value) so runtime
+    // `PUT /api/config/default-cat` (which calls `setRuntimeDefaultCatId` →
+    // updates `_runtimeDefaultCatId`) propagates to ConnectorRouter's
+    // per-message parseMentions resolve, without needing a gateway restart.
+    // An object getter or a one-shot value would still be copied as a
+    // string into `new ConnectorRouter({ defaultCatId, ... })` and frozen.
+    defaultCatId: getDefaultCatId,
     redis: redisClient ?? undefined,
     log: app.log,
     agentRegistry,
