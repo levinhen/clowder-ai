@@ -199,7 +199,7 @@ describe('MCP Evidence Tools', () => {
           {
             title: 'Vision discussion',
             anchor: 'thread:vision',
-            snippet: 'CVO asked about entity anchors',
+            snippet: 'operator asked about entity anchors',
             confidence: 'high',
             sourceType: 'discussion',
             matchReason: 'entity:person:landy',
@@ -208,13 +208,13 @@ describe('MCP Evidence Tools', () => {
                 entityId: 'person:landy',
                 type: 'person',
                 canonicalName: 'You',
-                matchedAlias: 'CVO',
-                surface: '铲屎官',
+                matchedAlias: 'operator',
+                surface: 'co-creator',
                 source: 'passage',
                 docAnchor: 'thread:vision',
                 passageId: 'p1',
                 provenance: [{ source: 'F209 Phase B MCP contract test' }],
-                why: 'query CVO matched entity person:landy via alias 铲屎官',
+                why: 'query operator matched entity person:landy via alias co-creator',
               },
             ],
           },
@@ -222,15 +222,15 @@ describe('MCP Evidence Tools', () => {
       }),
     });
 
-    const result = await handleSearchEvidence({ query: 'CVO', mode: 'hybrid' });
+    const result = await handleSearchEvidence({ query: 'operator', mode: 'hybrid' });
     const text = result.content[0].text;
 
     assert.ok(text.includes('match: entity:person:landy'), 'should keep coarse entity match reason');
     assert.ok(text.includes('entity: person:landy'), 'should render entity id');
-    assert.ok(text.includes('matchedAlias=CVO'), 'should render the query alias');
-    assert.ok(text.includes('surface=铲屎官'), 'should render the matched surface');
+    assert.ok(text.includes('matchedAlias=operator'), 'should render the query alias');
+    assert.ok(text.includes('surface=co-creator'), 'should render the matched surface');
     assert.ok(
-      text.includes('why: query CVO matched entity person:landy via alias 铲屎官'),
+      text.includes('why: query operator matched entity person:landy via alias co-creator'),
       'should render entity match why explanation',
     );
     assert.ok(text.includes('provenance: F209 Phase B MCP contract test'), 'should render entity match provenance');
@@ -247,7 +247,7 @@ describe('MCP Evidence Tools', () => {
           {
             title: 'Vision discussion',
             anchor: 'thread:vision',
-            snippet: 'CVO asked about drill-down readers',
+            snippet: 'operator asked about drill-down readers',
             confidence: 'high',
             sourceType: 'discussion',
             drillDown: {
@@ -414,6 +414,58 @@ describe('MCP Evidence Tools', () => {
       text.includes('Evidence search request failed for "quoted \\"topic\\"": connection refused'),
       'should include JSON-quoted query in request error output',
     );
+  });
+
+  test('intent=coverage formats CoverageSearchResult matrix instead of crashing (P1-2)', async () => {
+    const { handleSearchEvidence } = await import('../dist/tools/evidence-tools.js');
+
+    globalThis.fetch = async () => ({
+      ok: true,
+      json: async () => ({
+        query: 'production data boundary',
+        totalHits: 2,
+        bySource: {
+          docs: { count: 1, cap: 25 },
+          threads: { count: 1, cap: 20 },
+          conventionGraph: { count: 0, cap: 10 },
+        },
+        matrix: [
+          {
+            anchor: 'docs/iron-rules.md',
+            title: 'Redis production Redis (sacred)',
+            kind: 'lesson',
+            matchType: 'direct',
+            confidence: 0.95,
+            source: 'docs',
+          },
+          {
+            anchor: 'thread:redis-debug',
+            title: 'Redis port 事故',
+            kind: 'discussion',
+            matchType: 'alias',
+            confidence: 0.7,
+            source: 'threads',
+            expansionProvenance: {
+              source: 'frontmatter-alias',
+              via: 'keyword:6399',
+              confidence: 'heuristic',
+            },
+          },
+        ],
+        gaps: [],
+      }),
+    });
+
+    const result = await handleSearchEvidence({ query: 'production data boundary', intent: 'coverage' });
+
+    assert.equal(result.isError, undefined, 'should not crash on coverage response shape');
+    const text = result.content[0].text;
+    assert.ok(text.includes('2'), 'should show total hits');
+    assert.ok(text.includes('Redis production Redis (sacred)'), 'should render matrix item titles');
+    assert.ok(text.includes('docs/iron-rules.md'), 'should render anchors');
+    assert.ok(text.includes('direct'), 'should show match types');
+    assert.ok(text.includes('alias'), 'should show indirect match types');
+    assert.ok(text.includes('frontmatter-alias'), 'should show expansion provenance');
   });
 
   test('search_evidence description warns coverage tasks are not single-query exhaustive', async () => {

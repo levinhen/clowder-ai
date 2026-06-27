@@ -3,6 +3,8 @@ import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, test } from 'node:test';
+import { resolveWorkspaceRoot } from '../dist/config/capabilities/mcp-config-adapters.js';
+import { prepareOpenCodeAcpSpawnConfig } from '../dist/domains/cats/services/agents/providers/opencode-acp-spawn-config.js';
 import {
   deriveOpenCodeApiType,
   generateOpenCodeConfig,
@@ -11,8 +13,28 @@ import {
   OC_BASE_URL_ENV,
   parseOpenCodeModel,
   summarizeOpenCodeRuntimeConfigForDebug,
+  writeOpenCodeInstructionsOnlyConfig,
   writeOpenCodeRuntimeConfig,
 } from '../dist/domains/cats/services/agents/providers/opencode-config-template.js';
+
+describe('opencode config module boundaries', () => {
+  test('keeps ACP spawn config in a dedicated module under the line budget', () => {
+    const templateSource = readFileSync(
+      new URL('../src/domains/cats/services/agents/providers/opencode-config-template.ts', import.meta.url),
+      'utf8',
+    );
+    const spawnSource = readFileSync(
+      new URL('../src/domains/cats/services/agents/providers/opencode-acp-spawn-config.ts', import.meta.url),
+      'utf8',
+    );
+
+    assert.ok(
+      templateSource.split('\n').length <= 350,
+      'opencode-config-template.ts should stay under the 350-line module budget',
+    );
+    assert.match(spawnSource, /prepareOpenCodeAcpSpawnConfig/);
+  });
+});
 
 describe('opencode Config Template (AC-9 + AC-10)', () => {
   test('generates valid opencode config with required fields', () => {
@@ -83,7 +105,7 @@ describe('opencode Config Template (AC-9 + AC-10)', () => {
     );
   });
 
-  test('does not include Cat Cafe MCP tools in config', () => {
+  test('does not include Clowder AI MCP tools in config', () => {
     const config = generateOpenCodeConfig({
       apiKey: 'sk-test',
       baseUrl: 'https://proxy.example/v1',
@@ -94,8 +116,8 @@ describe('opencode Config Template (AC-9 + AC-10)', () => {
     if (config.mcp) {
       const mcpKeys = Object.keys(config.mcp);
       for (const key of mcpKeys) {
-        assert.ok(!key.startsWith('cat_cafe'), `MCP config must not include Cat Cafe tools: ${key}`);
-        assert.ok(!key.startsWith('cat-cafe'), `MCP config must not include Cat Cafe tools: ${key}`);
+        assert.ok(!key.startsWith('cat_cafe'), `MCP config must not include Clowder AI tools: ${key}`);
+        assert.ok(!key.startsWith('cat-cafe'), `MCP config must not include Clowder AI tools: ${key}`);
       }
     }
   });
@@ -206,6 +228,95 @@ describe('deriveOpenCodeApiType', () => {
   });
 });
 
+describe('prepareOpenCodeAcpSpawnConfig', () => {
+  test('writes OPENCODE_CONFIG and credential env for OpenCode ACP api_key accounts', () => {
+    const projectRoot = mkdtempSync(join(tmpdir(), 'cat-cafe-opencode-acp-'));
+    try {
+      const prepared = prepareOpenCodeAcpSpawnConfig({
+        projectRoot,
+        profileId: 'opencode-acp',
+        clientId: 'opencode',
+        command: '/opt/homebrew/bin/opencode',
+        providerName: 'anthropic',
+        defaultModel: 'anthropic/claude-opus-4-6',
+        account: {
+          id: 'anthropic-proxy',
+          authType: 'api_key',
+          apiKey: 'sk-test-secret',
+          baseUrl: 'https://proxy.example/v1',
+          models: ['claude-opus-4-6'],
+        },
+      });
+
+      assert.ok(prepared, 'OpenCode ACP should receive a prepared spawn config');
+      assert.ok(prepared.env.OPENCODE_CONFIG, 'OPENCODE_CONFIG must be set for OpenCode ACP');
+      assert.equal(prepared.env[OC_API_KEY_ENV], 'sk-test-secret');
+      assert.equal(prepared.env[OC_BASE_URL_ENV], 'https://proxy.example/v1');
+
+      const config = JSON.parse(readFileSync(prepared.env.OPENCODE_CONFIG, 'utf8'));
+      assert.equal(config.model, 'anthropic/claude-opus-4-6');
+      assert.equal(config.small_model, 'anthropic/claude-opus-4-6');
+      assert.equal(config.provider.anthropic.options.apiKey, `{env:${OC_API_KEY_ENV}}`);
+      assert.equal(config.provider.anthropic.options.baseURL, `{env:${OC_BASE_URL_ENV}}`);
+      assert.ok(!JSON.stringify(config).includes('sk-test-secret'), 'runtime config must not write secrets');
+    } finally {
+      rmSync(projectRoot, { recursive: true, force: true });
+    }
+  });
+
+  test('does NOT manage generic ACP by command basename (clientId=acp + command=opencode → null)', () => {
+    const projectRoot = mkdtempSync(join(tmpdir(), 'cat-cafe-opencode-acp-generic-'));
+    try {
+      // F161 cleanup: generic ACP (clientId='acp') must NOT be auto-upgraded to
+      // OpenCode managed config by sniffing the command basename. OpenCode managed
+      // config is opt-in via clientId='opencode' only. A generic carrier that happens
+      // to point at the opencode binary stays on the pure generic env path.
+      const prepared = prepareOpenCodeAcpSpawnConfig({
+        projectRoot,
+        profileId: 'generic-acp-opencode',
+        clientId: 'acp',
+        command: 'opencode',
+        providerName: undefined,
+        defaultModel: 'anthropic/claude-opus-4-6',
+        account: {
+          id: 'anthropic-proxy',
+          authType: 'api_key',
+          apiKey: 'sk-test-secret',
+          baseUrl: 'https://proxy.example/v1',
+          models: ['claude-opus-4-6'],
+        },
+      });
+
+      assert.equal(prepared, null, 'generic ACP must not get OpenCode managed config via command sniffing');
+    } finally {
+      rmSync(projectRoot, { recursive: true, force: true });
+    }
+  });
+
+  test('skips non-OpenCode ACP clients', () => {
+    const projectRoot = mkdtempSync(join(tmpdir(), 'cat-cafe-opencode-acp-skip-'));
+    try {
+      const prepared = prepareOpenCodeAcpSpawnConfig({
+        projectRoot,
+        profileId: 'gemini-acp',
+        clientId: 'google',
+        command: 'gemini',
+        providerName: 'google',
+        defaultModel: 'gemini-3-flash',
+        account: {
+          id: 'gemini',
+          authType: 'oauth',
+          models: ['gemini-3-flash'],
+        },
+      });
+
+      assert.equal(prepared, null);
+    } finally {
+      rmSync(projectRoot, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('generateOpenCodeRuntimeConfig', () => {
   test('generates custom provider config with env placeholders and stripped model keys', () => {
     const config = generateOpenCodeRuntimeConfig({
@@ -217,6 +328,7 @@ describe('generateOpenCodeRuntimeConfig', () => {
     });
 
     assert.equal(config.model, 'maas/glm-5');
+    assert.equal(config.small_model, 'maas/glm-5');
     assert.deepStrictEqual(config.provider.maas.models, {
       'glm-5': { name: 'glm-5' },
       'glm-4-plus': { name: 'glm-4-plus' },
@@ -272,6 +384,19 @@ describe('generateOpenCodeRuntimeConfig', () => {
     assert.ok(config.provider['openai-compat'].models?.['qwen3.6-max-preview']);
   });
 
+  test('pins small_model to the remapped default model for OpenCode title generation', () => {
+    const config = generateOpenCodeRuntimeConfig({
+      providerName: 'openai',
+      models: ['gpt-4o'],
+      defaultModel: 'openai/gpt-4o',
+      apiType: 'openai',
+      hasBaseUrl: true,
+    });
+
+    assert.equal(config.model, 'openai-compat/gpt-4o');
+    assert.equal(config.small_model, 'openai-compat/gpt-4o');
+  });
+
   test('non-reserved providerName is kept as-is', () => {
     const config = generateOpenCodeRuntimeConfig({
       providerName: 'kimi',
@@ -306,6 +431,55 @@ describe('generateOpenCodeRuntimeConfig', () => {
       type: 'local',
       command: ['node', '/absolute/path/to/packages/mcp-server/dist/index.js'],
     });
+  });
+
+  test('mcp.cat-cafe environment uses the invocation workspace', () => {
+    const config = generateOpenCodeRuntimeConfig({
+      providerName: 'anthropic',
+      models: ['anthropic/claude-opus-4-6'],
+      defaultModel: 'anthropic/claude-opus-4-6',
+      apiType: 'anthropic',
+      mcpServerPath: '/absolute/path/to/packages/mcp-server/dist/index.js',
+      allowedWorkspaceDirs: '/tmp/project',
+    });
+
+    assert.deepStrictEqual(config.mcp['cat-cafe'], {
+      type: 'local',
+      command: ['node', '/absolute/path/to/packages/mcp-server/dist/index.js'],
+      environment: {
+        ALLOWED_WORKSPACE_DIRS: '/tmp/project',
+      },
+    });
+  });
+
+  test('mcp.cat-cafe environment drives MCP workspace resolution', () => {
+    const originalAwd = process.env.ALLOWED_WORKSPACE_DIRS;
+    const originalWorkspace = process.env.CAT_CAFE_WORKSPACE_ROOT;
+    try {
+      process.env.ALLOWED_WORKSPACE_DIRS = '/stale/parent/workspace';
+      delete process.env.CAT_CAFE_WORKSPACE_ROOT;
+      const config = generateOpenCodeRuntimeConfig({
+        providerName: 'anthropic',
+        models: ['anthropic/claude-opus-4-6'],
+        defaultModel: 'anthropic/claude-opus-4-6',
+        apiType: 'anthropic',
+        mcpServerPath: '/absolute/path/to/packages/mcp-server/dist/index.js',
+        allowedWorkspaceDirs: '/tmp/project',
+      });
+
+      process.env.ALLOWED_WORKSPACE_DIRS = config.mcp['cat-cafe'].environment.ALLOWED_WORKSPACE_DIRS;
+
+      assert.equal(
+        resolveWorkspaceRoot(),
+        '/tmp/project',
+        'OpenCode MCP child env must make Clowder AI MCP resolve the invocation workspace',
+      );
+    } finally {
+      if (originalAwd === undefined) delete process.env.ALLOWED_WORKSPACE_DIRS;
+      else process.env.ALLOWED_WORKSPACE_DIRS = originalAwd;
+      if (originalWorkspace === undefined) delete process.env.CAT_CAFE_WORKSPACE_ROOT;
+      else process.env.CAT_CAFE_WORKSPACE_ROOT = originalWorkspace;
+    }
   });
 
   test('#871: non-api_key runtime config can omit provider auth placeholders', () => {
@@ -345,6 +519,23 @@ describe('generateOpenCodeRuntimeConfig', () => {
     assert.strictEqual(config.mcp, undefined, 'config must not have mcp section without mcpServerPath');
   });
 
+  test('#935: externalDirectories emits OpenCode external_directory permission globs', () => {
+    const config = generateOpenCodeRuntimeConfig({
+      providerName: 'anthropic',
+      models: ['anthropic/claude-opus-4-6'],
+      defaultModel: 'anthropic/claude-opus-4-6',
+      apiType: 'anthropic',
+      externalDirectories: ['/home/user/cat-cafe/', 'C:\\Dev\\monorepo'],
+    });
+
+    assert.deepStrictEqual(config.permission, {
+      external_directory: {
+        '/home/user/cat-cafe/**': 'allow',
+        'C:/Dev/monorepo/**': 'allow',
+      },
+    });
+  });
+
   test('summarizeOpenCodeRuntimeConfigForDebug reports provider adapter and model keys', () => {
     const summary = summarizeOpenCodeRuntimeConfigForDebug({
       providerName: 'anthropic',
@@ -355,6 +546,7 @@ describe('generateOpenCodeRuntimeConfig', () => {
     });
 
     assert.equal(summary.model, 'anthropic/minimax-m2.7');
+    assert.equal(summary.smallModel, 'anthropic/minimax-m2.7');
     assert.deepStrictEqual(summary.providerKeys, ['anthropic']);
     assert.deepStrictEqual(summary.providerSummary, {
       anthropic: {
@@ -365,6 +557,34 @@ describe('generateOpenCodeRuntimeConfig', () => {
         baseUrlSource: `env:${OC_BASE_URL_ENV}`,
       },
     });
+  });
+});
+
+describe('writeOpenCodeInstructionsOnlyConfig', () => {
+  test('#935: writes external_directory permission rules without provider config', () => {
+    const tmpRoot = mkdtempSync(join(tmpdir(), 'oc-instructions-only-external-'));
+    try {
+      const configPath = writeOpenCodeInstructionsOnlyConfig(
+        tmpRoot,
+        'opencode',
+        'inv-external',
+        ['/tmp/l0.md', '/project/OPENCODE.md'],
+        ['/opt/cat-cafe'],
+      );
+
+      const content = JSON.parse(readFileSync(configPath, 'utf-8'));
+      assert.deepStrictEqual(content.instructions, ['/tmp/l0.md', '/project/OPENCODE.md']);
+      assert.deepStrictEqual(content.permission, {
+        external_directory: {
+          '/opt/cat-cafe/**': 'allow',
+        },
+      });
+      assert.strictEqual(content.provider, undefined, 'instructions-only config must not add provider');
+      assert.strictEqual(content.model, undefined, 'instructions-only config must not add model');
+      assert.strictEqual(content.mcp, undefined, 'instructions-only config must not add mcp');
+    } finally {
+      rmSync(tmpRoot, { recursive: true, force: true });
+    }
   });
 });
 

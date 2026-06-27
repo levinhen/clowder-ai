@@ -1,17 +1,6 @@
 import { mkdirSync, renameSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
-/**
- * opencode Config Template Generator
- * Generates opencode.json configuration for Cat Cafe runtime.
- *
- * opencode reads its config from opencode.json (per-project or ~/.config/opencode/).
- * This generator produces a config with:
- * - Anthropic provider (via proxy)
- * - Optional OMOC plugin (oh-my-opencode)
- * - Optional Clowder AI MCP server (deterministic injection via mcpServerPath)
- */
-
 interface OpenCodeConfigOptions {
   /** Anthropic API key — validated but NOT written to config (stays in ANTHROPIC_API_KEY env var) */
   apiKey: string;
@@ -32,14 +21,21 @@ type OpenCodeProviderConfig = {
   };
 };
 
+type OpenCodePermissionAction = 'allow' | 'ask' | 'deny';
+
 interface OpenCodeConfig {
   $schema: string;
   model?: string;
+  small_model?: string;
   provider: Record<string, OpenCodeProviderConfig>;
   plugin?: string[];
   mcp?: Record<string, unknown>;
-  /** F203 Phase I: instruction file paths for native L0 injection (compression-immune system role). */
+  /** Instruction file paths for native L0 injection (compression-immune system role). */
   instructions?: string[];
+  /** OpenCode permission grants for directories outside the working directory. */
+  permission?: {
+    external_directory?: Record<string, OpenCodePermissionAction>;
+  };
 }
 
 export function generateOpenCodeConfig(options: OpenCodeConfigOptions): OpenCodeConfig {
@@ -111,16 +107,20 @@ export interface OpenCodeRuntimeConfigOptions {
   omitProviderAuth?: boolean;
   /** Absolute path to Clowder AI MCP server entry (packages/mcp-server/dist/index.js). */
   mcpServerPath?: string;
+  /** Workspace exposed to Clowder AI MCP servers for this invocation. */
+  allowedWorkspaceDirs?: string;
   /**
    * F203 Phase I: Instruction file paths injected into OpenCode's `instructions` config.
-   * These are loaded by OpenCode every turn into `role: "system"` messages — compression-immune.
-   * Typical contents: [compiledL0Path, "OPENCODE.md"].
+   * Loaded every turn into `role: "system"` messages — compression-immune.
    */
   instructions?: readonly string[];
+  /** #935: Directories outside cwd granted `permission.external_directory` access. */
+  externalDirectories?: readonly string[];
 }
 
 export interface OpenCodeRuntimeConfigDebugSummary {
   model?: string;
+  smallModel?: string;
   providerKeys: string[];
   providerSummary: Record<
     string,
@@ -164,6 +164,17 @@ export function safeProviderName(name: string): string {
   return OPENCODE_BUILTIN_NAMES.has(name) ? `${name}-compat` : name;
 }
 
+function buildExternalDirectoryPermissions(
+  externalDirectories?: readonly string[],
+): Record<string, OpenCodePermissionAction> | undefined {
+  const rules: Record<string, OpenCodePermissionAction> = {};
+  for (const directory of externalDirectories ?? []) {
+    const normalized = directory.trim().replace(/\\/g, '/').replace(/\/+$/, '');
+    if (normalized) rules[`${normalized}/**`] = 'allow';
+  }
+  return Object.keys(rules).length > 0 ? rules : undefined;
+}
+
 export function generateOpenCodeRuntimeConfig(options: OpenCodeRuntimeConfigOptions): OpenCodeConfig {
   const {
     providerName,
@@ -173,7 +184,9 @@ export function generateOpenCodeRuntimeConfig(options: OpenCodeRuntimeConfigOpti
     hasBaseUrl = false,
     omitProviderAuth = false,
     mcpServerPath,
+    allowedWorkspaceDirs,
     instructions,
+    externalDirectories,
   } = options;
 
   const configName = safeProviderName(providerName);
@@ -192,7 +205,7 @@ export function generateOpenCodeRuntimeConfig(options: OpenCodeRuntimeConfigOpti
 
   const config: OpenCodeConfig = {
     $schema: 'https://opencode.ai/config.json',
-    ...(configDefaultModel ? { model: configDefaultModel } : {}),
+    ...(configDefaultModel ? { model: configDefaultModel, small_model: configDefaultModel } : {}),
     provider: {
       [configName]: {
         npm: NPM_ADAPTER_FOR_API_TYPE[apiType] ?? NPM_ADAPTER_FOR_API_TYPE.openai,
@@ -210,6 +223,7 @@ export function generateOpenCodeRuntimeConfig(options: OpenCodeRuntimeConfigOpti
       'cat-cafe': {
         type: 'local',
         command: ['node', mcpServerPath],
+        ...(allowedWorkspaceDirs ? { environment: { ALLOWED_WORKSPACE_DIRS: allowedWorkspaceDirs } } : {}),
       },
     };
   }
@@ -219,6 +233,16 @@ export function generateOpenCodeRuntimeConfig(options: OpenCodeRuntimeConfigOpti
   // so these are additive to any project-root opencode.json instructions.
   if (instructions && instructions.length > 0) {
     config.instructions = [...instructions];
+  }
+
+  // #935: Grant external_directory permission for Clowder AI-approved workspace roots.
+  // Without this, OpenCode on Windows rejects tool calls that touch paths outside
+  // the working directory, forcing users to edit global config manually.
+  const externalDirectoryPermissions = buildExternalDirectoryPermissions(externalDirectories);
+  if (externalDirectoryPermissions) {
+    config.permission = {
+      external_directory: externalDirectoryPermissions,
+    };
   }
 
   return config;
@@ -238,6 +262,7 @@ export function summarizeOpenCodeRuntimeConfigForDebug(
 
   return {
     model: config.model,
+    smallModel: config.small_model,
     providerKeys: providerEntries.map(([providerName]) => providerName),
     providerSummary: Object.fromEntries(
       providerEntries.map(([providerName, providerConfig]) => [
@@ -276,6 +301,7 @@ export function writeOpenCodeInstructionsOnlyConfig(
   catId: string,
   invocationId: string,
   instructions: readonly string[],
+  externalDirectories?: readonly string[],
 ): string {
   const safeCatId = sanitizePathSegment(catId);
   const safeInvocationId = sanitizePathSegment(invocationId);
@@ -283,10 +309,14 @@ export function writeOpenCodeInstructionsOnlyConfig(
   mkdirSync(configDir, { recursive: true });
   const configPath = join(configDir, 'opencode.json');
   const tempPath = `${configPath}.tmp-${process.pid}`;
-  const config: Pick<OpenCodeConfig, '$schema' | 'instructions'> = {
+  const config: Pick<OpenCodeConfig, '$schema' | 'instructions' | 'permission'> = {
     $schema: 'https://opencode.ai/config.json',
     instructions: [...instructions],
   };
+  const externalDirectoryPermissions = buildExternalDirectoryPermissions(externalDirectories);
+  if (externalDirectoryPermissions) {
+    config.permission = { external_directory: externalDirectoryPermissions };
+  }
   writeFileSync(tempPath, JSON.stringify(config, null, 2), 'utf-8');
   renameSync(tempPath, configPath);
   return configPath;

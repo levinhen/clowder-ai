@@ -226,7 +226,12 @@ else
     echo -e "${RED}❌ pnpm install --frozen-lockfile 失败${NC}"
     exit 1
   fi
-  echo -e "${GREEN}✓ 依赖刷新通过${NC}"
+  if ! pnpm run check:biome-version; then
+    echo ""
+    echo -e "${RED}❌ Biome 版本与 lockfile 不匹配${NC}"
+    exit 1
+  fi
+  echo -e "${GREEN}✓ 依赖刷新 + Biome 工具链校验通过${NC}"
   echo ""
 fi
 record_step "install" "$STEP_START"
@@ -362,5 +367,10 @@ echo -e "$STEP_TIMES" | while IFS=: read -r name secs; do
 done
 printf "║    %-14s %3ds\n" "TOTAL" "$GATE_TOTAL"
 echo "╚══════════════════════════════════════════════════════╝"
+echo ""
+# LL-082 hard layer: list dirty worktrees so each uncommitted diff has known provenance
+# before merge (H4 dogfood: an orphaned half-fix in a sibling worktree crossed the gate).
+echo "── LL-082 dirty-worktree ledger（merge 前确认所有 worktree 的 dirty diff 都有 PR/task/comment 归属）──"
+node "$(dirname "$0")/check-worktree-dirty-ledger.mjs" || true
 echo ""
 echo "可以安全执行 merge-gate 的后续步骤了。"

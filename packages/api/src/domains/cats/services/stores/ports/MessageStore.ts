@@ -104,16 +104,21 @@ export interface StoredMessage {
      *      hydrate/merge stable key; required so same-parent multi-turn-same-cat bubbles do NOT merge)
      *  Frontend prefers `turnInvocationId` (fallback `invocationId` for legacy messages). */
     stream?: { invocationId: string; turnInvocationId?: string };
-    crossPost?: { sourceThreadId: string; sourceInvocationId?: string };
+    crossPost?: {
+      sourceThreadId: string;
+      sourceInvocationId?: string;
+      /** F246 Phase B: effect-class label carried for receiving-side constraints */
+      effectClass?: 'fyi' | 'coordinate' | 'investigate' | 'assign_work';
+    };
     targetCats?: string[];
     scheduler?: SchedulerMessageExtra['scheduler'];
     tracing?: { traceId: string; spanId: string; parentSpanId?: string };
-    systemKind?: 'a2a_routing';
+    systemKind?: 'a2a_routing' | 'context_briefing';
     a2aRouting?: { fromCatId?: string; targetCatId?: string; invocationId?: string };
   };
   /** CatIds mentioned in this message */
   mentions: readonly CatId[];
-  /** F057-C2: Whether this message mentions the user (@user / @铲屎官) */
+  /** F057-C2: Whether this message mentions the user (@user / @co-creator) */
   mentionsUser?: boolean;
   timestamp: number;
   /** F045: Extended thinking content (accumulated from CLI thinking blocks). Persisted for F5 recovery. */
@@ -619,8 +624,13 @@ export class MessageStore {
       if (msg.deletedAt) continue;
       if (!isDelivered(msg)) continue; // F117: exclude queued/canceled
       if (userId && msg.userId !== userId && !isSystemUserMessage(msg)) continue;
-      if (msg.timestamp > timestamp) continue;
-      if (msg.timestamp === timestamp) {
+      // F232 P1 (cloud review): 游标按 effective order time（deliveredAt ?? timestamp）比较，
+      // 与 RedisMessageStore 的 zset score 语义一致——queued 消息投递后 markDelivered 会把其
+      // effective order time 推到 deliveredAt。若仍按 raw timestamp 比较，传入 deliveredAt 游标时
+      // 游标消息自身（timestamp < deliveredAt）会被重复包含 → collectAllThreadMessages 同页无限循环。
+      const effectiveTs = msg.deliveredAt ?? msg.timestamp;
+      if (effectiveTs > timestamp) continue;
+      if (effectiveTs === timestamp) {
         if (!beforeId || msg.id >= beforeId) continue;
       }
       matches.push(msg);
@@ -820,7 +830,12 @@ export async function hydrateReplyPreview(store: IMessageStore, replyToId: strin
 export async function hydrateCrossThreadReplyHint(
   store: IMessageStore,
   triggerMessageId: string,
-): Promise<{ sourceThreadId: string; senderCatId: CatId } | null> {
+): Promise<{
+  sourceThreadId: string;
+  senderCatId: CatId;
+  /** F246 Phase B: effect-class from the cross-post trigger message */
+  effectClass?: 'fyi' | 'coordinate' | 'investigate' | 'assign_work';
+} | null> {
   const trigger = await store.getById(triggerMessageId);
   if (!trigger) return null;
   const sourceThreadId = trigger.extra?.crossPost?.sourceThreadId;
@@ -829,5 +844,6 @@ export async function hydrateCrossThreadReplyHint(
   return {
     sourceThreadId,
     senderCatId: trigger.catId,
+    ...(trigger.extra?.crossPost?.effectClass ? { effectClass: trigger.extra.crossPost.effectClass } : {}),
   };
 }

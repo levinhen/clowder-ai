@@ -4,6 +4,11 @@ import { isBubbleInvariantStrictModeOn, recordBubbleInvariantViolation } from '@
 import { recordDebugEvent } from '@/debug/invocationEventDebug';
 import { getCachedCats } from '@/hooks/useCatData';
 import { inferFileKind, inferRenderMode } from '@/lib/file-kind';
+import {
+  resolveNavigateTargetWorktreeId,
+  scopeWorktreeAliases,
+  type WorktreeAliasMap,
+} from '@/utils/worktree-id-alias';
 import { saveThreadMessages as saveMessagesSnapshot, saveThreads as saveThreadsSnapshot } from '../utils/offline-store';
 import { findBubbleStoreInvariantViolations } from './bubble-invariants';
 import type {
@@ -968,6 +973,8 @@ export interface ChatState {
   // ── F63: Workspace Explorer ──
   rightPanelMode: 'status' | 'workspace' | 'transcript';
   workspaceWorktreeId: string | null;
+  workspaceWorktreeAliases: WorktreeAliasMap;
+  workspaceWorktreeAliasesProjectPath: string | null;
   workspaceOpenTabs: string[];
   workspaceOpenFilePath: string | null;
   workspaceOpenFileLine: number | null;
@@ -977,7 +984,11 @@ export interface ChatState {
    * Used by WorkspacePanel to distinguish fresh navigate from stale leftovers on mount. */
   _workspaceFileSetAt: { ts: number; threadId: string | null };
   setRightPanelMode: (mode: 'status' | 'workspace' | 'transcript') => void;
+  /** 显式关闭右侧 panel 时退出 workspace/transcript mode（否则 ChatContainer auto-open effect 立即重开，关不掉）。 */
+  closeRightPanel: () => void;
   setWorkspaceWorktreeId: (id: string | null) => void;
+  normalizeWorkspaceWorktreeId: (id: string | null) => void;
+  setWorkspaceWorktreeAliases: (aliases: WorktreeAliasMap, projectPath?: string) => void;
   setWorkspaceOpenFile: (
     path: string | null,
     line?: number | null,
@@ -1009,9 +1020,12 @@ export interface ChatState {
   setFloatSize: (size: { width: number; height: number }) => void;
   toggleMaximize: () => void;
 
-  // Phase H + F139 + F160 + F168: Workspace mode
-  workspaceMode: 'dev' | 'recall' | 'schedule' | 'tasks' | 'community';
-  setWorkspaceMode: (mode: 'dev' | 'recall' | 'schedule' | 'tasks' | 'community') => void;
+  // Phase H + F139 + F160 + F168 + F246: Workspace mode
+  // F233 Phase C C3: 'trajectory' — feat 球权轨迹时间轴
+  workspaceMode: 'dev' | 'recall' | 'schedule' | 'tasks' | 'community' | 'artifacts' | 'approval' | 'trajectory';
+  setWorkspaceMode: (
+    mode: 'dev' | 'recall' | 'schedule' | 'tasks' | 'community' | 'artifacts' | 'approval' | 'trajectory',
+  ) => void;
 
   // ── F195 Phase C: Floating transcript window ──
   floatingTranscriptVisible: boolean;
@@ -1269,6 +1283,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
   // ── F63: Workspace Explorer ──
   rightPanelMode: 'status' as const,
   workspaceWorktreeId: null,
+  workspaceWorktreeAliases: {},
+  workspaceWorktreeAliasesProjectPath: null,
   workspaceOpenTabs: [],
   workspaceOpenFilePath: null,
   workspaceOpenFileLine: null,
@@ -1276,6 +1292,13 @@ export const useChatStore = create<ChatState>((set, get) => ({
   workspaceEditTokenExpiry: null,
   _workspaceFileSetAt: { ts: 0, threadId: null },
   setRightPanelMode: (mode) => set({ rightPanelMode: mode }),
+  // F232 P2（云端 round 5）：workspace/transcript mode 被 ChatContainer auto-open effect 强制开，
+  // 显式关闭 panel 时必须先退出这两个 mode 回 status，否则 effect 立即重开（关不掉）。status 无此问题，保留。
+  closeRightPanel: () =>
+    set((s) => ({
+      rightPanelMode:
+        s.rightPanelMode === 'workspace' || s.rightPanelMode === 'transcript' ? 'status' : s.rightPanelMode,
+    })),
   setWorkspaceWorktreeId: (id) => {
     // Guard: skip destructive reset when worktreeId is unchanged.
     // setWorkspaceWorktreeId unconditionally clears openFilePath/openTabs,
@@ -1298,13 +1321,53 @@ export const useChatStore = create<ChatState>((set, get) => ({
       });
     }
   },
+  normalizeWorkspaceWorktreeId: (id) =>
+    set((state) => {
+      if (id === state.workspaceWorktreeId) return state;
+      const oldWorktreeId = state.workspaceWorktreeId;
+      const lock = state.presentationLock;
+      return {
+        workspaceWorktreeId: id,
+        workspaceEditToken: null,
+        workspaceEditTokenExpiry: null,
+        ...(lock
+          ? {
+              presentationLock: {
+                ...lock,
+                worktreeId: lock.worktreeId === oldWorktreeId ? id : lock.worktreeId,
+                ownerWorkspace:
+                  lock.ownerWorkspace.worktreeId === oldWorktreeId
+                    ? { ...lock.ownerWorkspace, worktreeId: id }
+                    : lock.ownerWorkspace,
+              },
+            }
+          : {}),
+      };
+    }),
+  setWorkspaceWorktreeAliases: (aliases, projectPath) =>
+    set({
+      workspaceWorktreeAliases: aliases,
+      workspaceWorktreeAliasesProjectPath: projectPath ?? get().currentProjectPath,
+    }),
   setWorkspaceOpenFile: (path, line, targetWorktreeId, originThreadId) => {
     if (path) {
       const stamp = { ts: Date.now(), threadId: originThreadId ?? get().currentThreadId };
+      const currentWorktreeId = get().workspaceWorktreeId;
+      const state = get();
+      const scopedAliases = scopeWorktreeAliases(
+        state.workspaceWorktreeAliases,
+        state.workspaceWorktreeAliasesProjectPath,
+        state.currentProjectPath,
+      );
+      const effectiveTargetWorktreeId = resolveNavigateTargetWorktreeId(
+        currentWorktreeId,
+        targetWorktreeId,
+        scopedAliases,
+      );
       // Switch worktree if a different one is specified
-      if (targetWorktreeId && targetWorktreeId !== get().workspaceWorktreeId) {
+      if (effectiveTargetWorktreeId && effectiveTargetWorktreeId !== currentWorktreeId) {
         set({
-          workspaceWorktreeId: targetWorktreeId,
+          workspaceWorktreeId: effectiveTargetWorktreeId,
           workspaceOpenTabs: [path],
           workspaceOpenFilePath: path,
           workspaceOpenFileLine: line ?? null,
@@ -2146,7 +2209,15 @@ export const useChatStore = create<ChatState>((set, get) => ({
     void saveThreadsSnapshot(threads).catch(() => {});
   },
   setCurrentProject: (projectPath) =>
-    set((state) => (state.currentProjectPath === projectPath ? state : { currentProjectPath: projectPath })),
+    set((state) =>
+      state.currentProjectPath === projectPath
+        ? state
+        : {
+            currentProjectPath: projectPath,
+            workspaceWorktreeAliases: {},
+            workspaceWorktreeAliasesProjectPath: projectPath,
+          },
+    ),
   setLoadingThreads: (loading) => set({ isLoadingThreads: loading }),
   setOfflineSnapshot: (v) => set({ isOfflineSnapshot: v }),
 
@@ -2273,7 +2344,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
           [state.currentThreadId]: saved,
         },
         ...flattened,
-        // #699: Clear reply-to when switching threads
+        // #934: Clear reply-to on switch — ChatInput will restore from threadReplyDrafts on mount.
+        // This prevents stale reply context from the outgoing thread leaking into the new thread.
         replyToMessage: null,
       };
     }),

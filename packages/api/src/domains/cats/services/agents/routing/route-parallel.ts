@@ -14,6 +14,14 @@ import {
   ROUTE_TOTAL_TOKENS,
 } from '../../../../../infrastructure/telemetry/genai-semconv.js';
 import { estimateTokens } from '../../../../../utils/token-counter.js';
+import { conciergeContextForCat, prepareConciergeContext } from '../../../../concierge/ConciergeRoutingInterceptor.js';
+import {
+  buildConciergeActions,
+  extractTriagePlanIdsFromActions,
+  stripTriagePlanMarkers,
+  type TriagePlanExtractionDeps,
+} from '../../../../concierge/concierge-reply-validator.js';
+import { buildConciergeSearchContext } from '../../../../concierge/concierge-search-context.js';
 import {
   ackGuideCompletion,
   guideContextForCat,
@@ -111,7 +119,7 @@ export async function* routeParallel(
     | undefined;
   // F092: Voice companion mode
   let voiceMode: boolean | undefined;
-  // F087: Bootcamp state for CVO onboarding
+  // F087: Bootcamp state for operator onboarding
   let bootcampState: InvocationContext['bootcampState'];
   const targetCatIds = new Set<string>(targetCats);
   // Thread read: shared across routingPolicy, voiceMode, bootcamp, SOP, and guide interceptor
@@ -157,6 +165,25 @@ export async function* routeParallel(
     dismissTracker: deps.invocationDeps.dismissTracker,
   });
 
+  // F229: Concierge interceptor — load duty-cat 岗位 context for concierge threads
+  const conciergeCtx = await prepareConciergeContext(routeThread, userId, deps.invocationDeps.conciergeConfigStore);
+
+  // F229 KD-17: Pre-fetch search context for concierge threads
+  let conciergeSearchContextString = '';
+  if ('conciergeConfig' in conciergeCtx && deps.invocationDeps.conciergeHandleMapStore) {
+    try {
+      const searchResult = await buildConciergeSearchContext({
+        userMessage: message,
+        threadId,
+        handleMapStore: deps.invocationDeps.conciergeHandleMapStore,
+        evidenceStore: deps.evidenceStore,
+      });
+      conciergeSearchContextString = searchResult.contextString;
+    } catch {
+      // Fail-open
+    }
+  }
+
   // F148 OQ-2: briefing→invocation link per cat (must be before Promise.all — TDZ fix)
   const catBriefingMessageId = new Map<string, string>();
   // F148 OQ-2: Collect tool names and coverage maps per cat for context eval
@@ -171,7 +198,7 @@ export async function* routeParallel(
       // compression-immune native system role (--system-prompt-file / -c)
       // ONLY for providers with native L0 injection (ClaudeAgentService -p,
       // ClaudeBgCarrierService, CodexAgent). Non-native providers (Gemini,
-      // Antigravity, CatAgent, A2A, OpenCode, Dare, Kimi…) still need full
+      // Antigravity, CatAgent, A2A, OpenCode, Kimi…) still need full
       // identity via user-message systemPrompt prepend, else they
       // lose identity/家规 entirely (云端 Codex P1-cloud-1, 2026-05-16).
       // mcpAvailable still gates the per-message HTTP callback fallback.
@@ -184,6 +211,8 @@ export async function* routeParallel(
       }
       const service = getService(deps.services, catId);
       const hasNativeL0 = service.injectsL0Natively?.() ?? false;
+      // Staging is injected in invoke-single-cat independently of staticIdentity
+      // (Cloud R2 P1 #2237 L1099). See route-serial.ts for the architecture rationale.
       const staticIdentity = hasNativeL0
         ? buildStaticIdentityPackOnly(catId, { packBlocks })
         : buildStaticIdentity(catId, { mcpAvailable, packBlocks });
@@ -245,6 +274,7 @@ export async function* routeParallel(
         mode: 'parallel',
         teammates,
         mcpAvailable,
+        nativeL0Injected: hasNativeL0,
         ...(promptTags && promptTags.length > 0 ? { promptTags } : {}),
         ...(activeParticipants.length > 0 ? { activeParticipants } : {}),
         ...(routingPolicy ? { routingPolicy } : {}),
@@ -254,6 +284,7 @@ export async function* routeParallel(
         ...(bootcampState ? { bootcampState, threadId, bootcampMemberCount } : {}),
         ...(alwaysOnDocs && alwaysOnInjectionMode === 'on' ? { alwaysOnDocs } : {}),
         ...guideContextForCat(guideCtx, catId, targetCatIds, threadId),
+        ...conciergeContextForCat(conciergeCtx, catId as string),
       });
       const continuityCapsule = buildCapsuleFromRouteState({
         threadId,
@@ -378,6 +409,8 @@ export async function* routeParallel(
           }
         }
 
+        /* @segment R1 — Mode System Prompt */
+        /* @segment R2 — Mode System Prompt (per-cat) */
         const parCatModePrompt = modeSystemPromptByCat?.[catId as string] ?? modeSystemPrompt;
         const parts = [invocationContext, parCatModePrompt, bootstrapCtx, mcpInstructions].filter(Boolean);
         if (inc.contextText) parts.push(inc.contextText);
@@ -430,6 +463,11 @@ export async function* routeParallel(
         } else {
           prompt = message;
         }
+      }
+
+      // F229 KD-17: Inject search context into duty cat prompt
+      if (conciergeSearchContextString && conciergeContextForCat(conciergeCtx, catId as string)?.conciergeConfig) {
+        prompt = `${prompt}\n${conciergeSearchContextString}`;
       }
 
       // F-parallel-cancel: each concurrent cat listens to ITS OWN slot signal, not the
@@ -940,7 +978,7 @@ export async function* routeParallel(
         const meta = catMeta.get(msg.catId);
         const sanitized = sanitizeInjectedContent(text);
         // F22: Extract cc_rich blocks from text + merge with buffered
-        const { cleanText: storedContent, blocks: textBlocks } = extractRichFromText(sanitized);
+        let { cleanText: storedContent, blocks: textBlocks } = extractRichFromText(sanitized);
         let allRichBlocks = [...bufferedBlocks, ...textBlocks, ...(catStreamRichBlocks.get(msg.catId) ?? [])];
         // F34-b: synthesize text-only audio blocks (voice messages)
         // F111: skip synthesis in voiceMode — frontend streams via /api/tts/stream
@@ -1039,9 +1077,64 @@ export async function* routeParallel(
           }
         }
 
+        let triagePlanIdsToLink: string[] = [];
+
+        // F229 KD-17: Post-process concierge reply — inject CardBlock actions from HandleMap markers
+        if (
+          'conciergeConfig' in conciergeCtx &&
+          conciergeContextForCat(conciergeCtx, msg.catId as string)?.conciergeConfig &&
+          deps.invocationDeps.conciergeHandleMapStore &&
+          storedContent
+        ) {
+          try {
+            // Phase B: pass triageDeps if TriagePlanStore is available
+            const triageDeps: TriagePlanExtractionDeps | undefined = deps.invocationDeps.conciergeTriagePlanStore
+              ? {
+                  triagePlanStore: deps.invocationDeps.conciergeTriagePlanStore,
+                  userId,
+                  sourceMessageId: currentUserMessageId ?? `triage-${Date.now()}`,
+                  ...(deps.invocationDeps.threadStore
+                    ? {
+                        targetCatsResolverDeps: {
+                          messageStore: deps.messageStore,
+                          threadStore: deps.invocationDeps.threadStore,
+                        },
+                      }
+                    : {}),
+                }
+              : undefined;
+            const conciergeActions = await buildConciergeActions(
+              storedContent,
+              threadId,
+              deps.invocationDeps.conciergeHandleMapStore,
+              triageDeps,
+            );
+            triagePlanIdsToLink = extractTriagePlanIdsFromActions(conciergeActions);
+            if (conciergeActions.length > 0) {
+              allRichBlocks = [
+                ...allRichBlocks,
+                {
+                  kind: 'card' as const,
+                  v: 1 as const,
+                  id: `concierge-actions-${Date.now()}`,
+                  title: '',
+                  actions: conciergeActions,
+                },
+              ];
+              // Strip <!-- triage-plan --> markers from stored content (cloud P2 fix).
+              // Users should not see raw HTML comment markers in the concierge panel.
+              if (triagePlanIdsToLink.length > 0) {
+                storedContent = stripTriagePlanMarkers(storedContent);
+              }
+            }
+          } catch {
+            // Fail-open
+          }
+        }
+
         const thinking = catThinking.get(msg.catId);
         try {
-          await deps.messageStore.append({
+          const storedMsg = await deps.messageStore.append({
             userId,
             catId: msg.catId as CatId,
             content: storedContent,
@@ -1067,6 +1160,16 @@ export async function* routeParallel(
               ...(msg.tracing ? { tracing: msg.tracing } : {}),
             },
           });
+          const triagePlanStore = deps.invocationDeps.conciergeTriagePlanStore;
+          if (triagePlanStore && triagePlanIdsToLink.length > 0) {
+            try {
+              await Promise.all(
+                triagePlanIdsToLink.map((planId) => triagePlanStore.setConfirmationMessageId(planId, storedMsg.id)),
+              );
+            } catch (err) {
+              log.warn({ err, threadId, messageId: storedMsg.id }, 'Failed to link triage plan confirmation message');
+            }
+          }
           // F088-P3: Stash rich blocks for outbound delivery
           if (options.persistenceContext && allRichBlocks.length > 0) {
             options.persistenceContext.richBlocks = [

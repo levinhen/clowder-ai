@@ -175,7 +175,13 @@ export function formatCatRoutingErrorPrefix(body: {
 export async function callbackPost(
   path: string,
   body: Record<string, unknown>,
-  options?: { enableOutbox?: boolean; agentKeyCatId?: string; forceAgentKey?: boolean },
+  options?: {
+    enableOutbox?: boolean;
+    agentKeyCatId?: string;
+    forceAgentKey?: boolean;
+    retryDelaysMs?: number[];
+    fetchTimeoutMs?: number;
+  },
 ): Promise<ToolResult> {
   const config = getCallbackConfig({
     agentKeyCatId: options?.agentKeyCatId,
@@ -190,7 +196,11 @@ export async function callbackPost(
       body, // headers-only auth (Phase F AC-F2)
       headers: buildAuthHeaders(config),
     },
-    { enableOutbox: options?.enableOutbox === true },
+    {
+      enableOutbox: options?.enableOutbox === true,
+      retryDelaysMs: options?.retryDelaysMs,
+      fetchTimeoutMs: options?.fetchTimeoutMs,
+    },
   );
   if (result.ok) return successResult(JSON.stringify(result.data));
 
@@ -489,6 +499,14 @@ export const crossPostMessageInputSchema = {
     .max(200)
     .optional()
     .describe('Optional idempotency key for at-least-once delivery de-duplication'),
+  effectClass: z
+    .enum(['fyi', 'coordinate', 'investigate', 'assign_work'])
+    .optional()
+    .describe(
+      'F246 Phase B: Effect-class of the cross-thread dispatch. ' +
+        'fyi/coordinate/investigate → auto-deliver (default). ' +
+        'assign_work → held as a DispatchProposal pending operator approval in the Approval Hub.',
+    ),
   agentKeyCatId: agentKeyCatIdSchema,
 };
 
@@ -500,6 +518,11 @@ export const listTasksInputSchema = {
     .enum(['work', 'pr_tracking'])
     .optional()
     .describe('Optional task kind filter (work = manual tasks, pr_tracking = PR automation)'),
+  taskId: z
+    .string()
+    .min(1)
+    .optional()
+    .describe('F236 why-drill: pass a taskId to retrieve that task with its full (untruncated) why field'),
 };
 
 /**
@@ -539,6 +562,7 @@ async function _executePostMessage(input: {
   clientMessageId?: string | undefined;
   targetCats?: string[] | undefined;
   agentKeyCatId?: string | undefined;
+  effectClass?: 'fyi' | 'coordinate' | 'investigate' | 'assign_work' | undefined;
 }): Promise<ToolResult> {
   // F174 Phase E (AC-E2/E5): explicit kind:'none' policy. There's no useful
   // local fallback for post_message — losing the message is preferable to
@@ -555,6 +579,7 @@ async function _executePostMessage(input: {
           ...(input.replyTo ? { replyTo: input.replyTo } : {}),
           clientMessageId: input.clientMessageId ?? randomUUID(),
           ...(input.targetCats?.length ? { targetCats: input.targetCats } : {}),
+          ...(input.effectClass ? { effectClass: input.effectClass } : {}),
         },
         { enableOutbox: true, agentKeyCatId: input.agentKeyCatId },
       ),
@@ -686,6 +711,7 @@ export async function handleGetThreadContext(input: {
 export async function handleGetMessage(input: {
   messageId: string;
   contextCount?: number | undefined;
+  mode?: 'preview' | 'full' | undefined;
   agentKeyCatId?: string | undefined;
 }): Promise<ToolResult> {
   return callbackGet(
@@ -693,6 +719,7 @@ export async function handleGetMessage(input: {
     {
       messageId: input.messageId,
       ...(input.contextCount ? { contextCount: String(input.contextCount) } : {}),
+      ...(input.mode ? { mode: input.mode } : {}),
     },
     { agentKeyCatId: input.agentKeyCatId },
   );
@@ -893,6 +920,7 @@ export async function handleCrossPostMessage(input: {
   replyTo?: string | undefined;
   clientMessageId?: string | undefined;
   agentKeyCatId?: string | undefined;
+  effectClass?: 'fyi' | 'coordinate' | 'investigate' | 'assign_work' | undefined;
 }): Promise<ToolResult> {
   // F193 AC-A4 closing砚砚 review P1: MCP layer fail-closed.
   // The API route layer (callbacks.ts) only triggers AC-A4 reject when
@@ -931,6 +959,7 @@ export async function handleCrossPostMessage(input: {
     ...(input.clientMessageId ? { clientMessageId: input.clientMessageId } : {}),
     ...(input.agentKeyCatId ? { agentKeyCatId: input.agentKeyCatId } : {}),
     ...(input.targetCats?.length ? { targetCats: input.targetCats } : {}),
+    ...(input.effectClass ? { effectClass: input.effectClass } : {}),
   });
 }
 
@@ -939,12 +968,14 @@ export async function handleListTasks(input: {
   catId?: string | undefined;
   status?: 'todo' | 'doing' | 'blocked' | 'done' | undefined;
   kind?: 'work' | 'pr_tracking' | undefined;
+  taskId?: string | undefined;
 }): Promise<ToolResult> {
   return callbackGet('/api/callbacks/list-tasks', {
     ...(input.threadId ? { threadId: input.threadId } : {}),
     ...(input.catId ? { catId: input.catId } : {}),
     ...(input.status ? { status: input.status } : {}),
     ...(input.kind ? { kind: input.kind } : {}),
+    ...(input.taskId ? { taskId: input.taskId } : {}),
   });
 }
 
@@ -1209,6 +1240,52 @@ export async function handleUnregisterTracking(input: { subjectKey: string }): P
     primary: () =>
       callbackPost('/api/callbacks/unregister-tracking', {
         subjectKey: input.subjectKey,
+      }),
+    policy: { kind: 'none' },
+  });
+}
+
+// F168 Phase B Task 6: Declare awaiting_external state for a community case
+export const communityAwaitExternalInputSchema = {
+  subjectKey: z
+    .string()
+    .min(1)
+    .describe(
+      'Community case subject key. Format: "issue:{owner/repo}#{number}" or "pr:{owner/repo}#{number}". ' +
+        'Example: "issue:my-org/my-repo#42".',
+    ),
+  reason: z
+    .string()
+    .max(500)
+    .optional()
+    .describe(
+      'Optional free-text reason describing what you are waiting for (e.g. "waiting for reporter to provide reproduction steps").',
+    ),
+};
+
+/**
+ * Declare that the owner (you) is waiting for an external response on a community case.
+ *
+ * WHEN TO USE: After responding to an issue/PR and explicitly waiting for the reporter or
+ * external contributor to reply. While in awaiting_external state:
+ *  - Maintainer (OWNER/MEMBER) activity on the case is silently logged — no wake notification.
+ *  - External actor (reporter, contributor) activity automatically restores the case to
+ *    in_progress and sends you a wake notification.
+ *
+ * EFFECT: Appends case.awaiting_external to the community event log and updates the
+ * projection so the community board shows the correct state.
+ */
+export async function handleCommunityAwaitExternal(input: {
+  subjectKey: string;
+  reason?: string;
+}): Promise<ToolResult> {
+  // URL-encode subjectKey so the colon, slashes, and hash are safe in the path segment
+  const encodedKey = encodeURIComponent(input.subjectKey);
+  return withDegradation({
+    toolName: 'community_await_external',
+    primary: () =>
+      callbackPost(`/api/community-issues/${encodedKey}/await-external`, {
+        ...(input.reason !== undefined ? { reason: input.reason } : {}),
       }),
     policy: { kind: 'none' },
   });
@@ -1491,7 +1568,7 @@ export const proposeThreadInputSchema = {
     .enum(['none', 'final-only', 'state-transitions', 'blocking-ack'])
     .optional()
     .describe(
-      'Optional F128 reporting contract for the sub-thread (AC-AA1: default is final-only). final-only (default): report a summary once on completion via cross_post with routing credentials. none (autonomous): downstream self-governs, no required report-back (only escalate CVO/blocker/irreversible/cross-feature conflict per house rules). state-transitions: report at each phase boundary. blocking-ack: wait for source-thread ack at each blocker. Triage/dispatch → none; fork-and-return needing a summary → final-only.',
+      'Optional F128 reporting contract for the sub-thread (AC-AA1: default is final-only). final-only (default): report a summary once on completion via cross_post with routing credentials. none (autonomous): downstream self-governs, no required report-back (only escalate operator/blocker/irreversible/cross-feature conflict per house rules). state-transitions: report at each phase boundary. blocking-ack: wait for source-thread ack at each blocker. Triage/dispatch → none; fork-and-return needing a summary → final-only.',
     ),
   parentThreadId: z.string().min(1).optional().describe('Optional parent thread ID. Defaults to the current thread.'),
   projectPath: z
@@ -1500,7 +1577,7 @@ export const proposeThreadInputSchema = {
     .max(500)
     .optional()
     .describe(
-      'Optional absolute project directory the child thread belongs to (e.g. "/home/user/clowder-ai"). This decides the working directory cats use when invoked in the new thread. Omit to inherit THIS thread\'s project; if THIS thread is default/未分类/eval/lobby and the child will do repo or implementation work, set projectPath explicitly. Invalid/non-existent paths are rejected (400), never silently defaulted. The user can also change it on the approval card.',
+      'Optional absolute project directory the child thread belongs to (e.g. "/home/user/projects/clowder-ai"). This decides the working directory cats use when invoked in the new thread. Omit to inherit THIS thread\'s project; if THIS thread is default/未分类/eval/lobby and the child will do repo or implementation work, set projectPath explicitly. Invalid/non-existent paths are rejected (400), never silently defaulted. The user can also change it on the approval card.',
     ),
   clientRequestId: z
     .string()
@@ -1621,6 +1698,76 @@ export async function handleProposeSessionHandoff(input: {
   return result;
 }
 
+// ============ F231 Phase C: Propose Profile Update ============
+
+export const proposeProfileUpdateInputSchema = {
+  afterContent: z
+    .string()
+    .min(1)
+    .max(20000)
+    .describe(
+      'The COMPLETE new primer content (whole-file replacement, NOT a diff/patch). On approval the server writes this verbatim into relationship/{yourCatId}-primer.md. Include everything you want kept — anything you omit is dropped.',
+    ),
+  rationale: z
+    .string()
+    .min(1)
+    .max(1000)
+    .describe(
+      'Why this update — shown to the operator on the confirmation card (e.g. "co-creator说更喜欢先给结论再展开，固化沟通偏好"). Be specific so the operator can judge the change at a glance.',
+    ),
+  signalKind: z
+    .enum(['cat-declared', 'cvo-instructed'])
+    .describe(
+      "Where the relationship signal came from (provenance). 'cat-declared' = you observed/inferred it from the interaction; 'cvo-instructed' = the operator explicitly asked you to remember it. AC-C1 is manual-entry only (no auto-classifier).",
+    ),
+  sourceMessageId: z
+    .string()
+    .min(1)
+    .optional()
+    .describe(
+      'Optional message ID that triggered this update (provenance trail — lets the audit log trace back to the exact message).',
+    ),
+  clientRequestId: z
+    .string()
+    .min(1)
+    .max(200)
+    .optional()
+    .describe('Optional idempotency key. Resending with the same value returns the same proposalId.'),
+};
+
+export async function handleProposeProfileUpdate(input: {
+  afterContent: string;
+  rationale: string;
+  signalKind: 'cat-declared' | 'cvo-instructed';
+  sourceMessageId?: string | undefined;
+  clientRequestId?: string | undefined;
+}): Promise<ToolResult> {
+  // Always send an idempotency key — auto-generate when the caller didn't supply one, so transient
+  // callbackPost retries never produce duplicate proposals (mirrors F128 handleProposeThread).
+  const body: Record<string, unknown> = {
+    afterContent: input.afterContent,
+    rationale: input.rationale,
+    signalKind: input.signalKind,
+    clientRequestId: input.clientRequestId ?? randomUUID(),
+  };
+  if (input.sourceMessageId) body.sourceMessageId = input.sourceMessageId;
+
+  const result = await callbackPost('/api/callbacks/propose-profile-update', body);
+  if (!result.isError) {
+    try {
+      const data = JSON.parse((result.content[0] as { text: string }).text);
+      if (data?.status === 'stale_ignored') {
+        return errorResult(
+          'Profile-update proposal was NOT created: this invocation has been superseded by a newer one (stale_ignored).',
+        );
+      }
+    } catch {
+      // parse failure is fine
+    }
+  }
+  return result;
+}
+
 // ============ Thread Cats Discovery ============
 
 export const getThreadCatsInputSchema = {};
@@ -1730,7 +1877,8 @@ export const callbackTools = [
       'Look up a single message by its messageId. Use when you receive a message with replyTo — ' +
       'call this to read the original quoted message and its surrounding context. ' +
       'Returns the message content, sender, timestamp, and optionally N nearby messages for context. ' +
-      'PARAM GUIDE: messageId = required exact ID. contextCount = number of messages before/after to include (default 0, max 10).',
+      'PARAM GUIDE: messageId = required exact ID. contextCount = number of messages before/after to include (default 0, max 10). ' +
+      'mode = "preview" (default — bounded excerpt that saves context) or "full" (complete original content; use when you need the whole message — anchor drillDown pointers already request mode=full).',
     inputSchema: {
       messageId: z.string().min(1).describe('The exact message ID to look up'),
       contextCount: z
@@ -1740,6 +1888,10 @@ export const callbackTools = [
         .max(10)
         .optional()
         .describe('Number of messages before and after to include for context (0-10, default 0)'),
+      mode: z
+        .enum(['preview', 'full'])
+        .optional()
+        .describe('preview (default, bounded excerpt) or full (complete content). F236 anchor-first drill terminal.'),
       agentKeyCatId: agentKeyCatIdSchema,
     },
     handler: handleGetMessage,
@@ -1819,7 +1971,7 @@ export const callbackTools = [
       'Use when: user says "建个毛线球", "记一下任务", "track this", or you identify persistent work items across sessions — ' +
       'e.g. "fix login timeout", "update API docs", "review F160 spec". ' +
       'NOT for: temporary execution steps (use PlanBoard/TodoWrite), NOT for inline checklists in a message (use create_rich_block with kind:"checklist"). ' +
-      'Output: task appears in the thread 🧶 毛线球 panel, persists across sessions, visible to all cats and 铲屎官. ' +
+      'Output: task appears in the thread 🧶 毛线球 panel, persists across sessions, visible to all cats and co-creator. ' +
       'GOTCHA: 毛线球 ≠ checklist rich block. 毛线球 lives in the task panel and survives session boundaries; checklist is ephemeral inline content in one message. ' +
       'TIP: Include a "why" to give context to whoever picks up the task. ' +
       'F193-E1 DISPATCH GATE: If your task references a feature (F-number) outside your current scope, ' +
@@ -1903,6 +2055,17 @@ export const callbackTools = [
       'Format: "pr:{owner/repo}#{num}" or "issue:{owner/repo}#{num}".',
     inputSchema: unregisterTrackingInputSchema,
     handler: handleUnregisterTracking,
+  },
+  {
+    name: 'cat_cafe_community_await_external',
+    description:
+      'Declare that you (the case owner) are waiting for an external response on a community case. ' +
+      'WHEN: After responding to an issue/PR and explicitly waiting for the reporter or contributor to reply. ' +
+      'EFFECT WHILE WAITING: Maintainer (OWNER/MEMBER) activity → silently logged, no wake. ' +
+      'External actor (reporter, contributor) activity → auto-restores case to in_progress + wakes you. ' +
+      'Provide the subjectKey in "issue:{owner/repo}#{number}" format (e.g. "issue:my-org/my-repo#42").',
+    inputSchema: communityAwaitExternalInputSchema,
+    handler: handleCommunityAwaitExternal,
   },
   {
     name: 'cat_cafe_update_workflow',
@@ -1990,6 +2153,19 @@ export const callbackTools = [
       'Use sparingly — only at genuinely clean breakpoints, never to escape a hard task mid-flight. Orthogonal to compression: compress is the lossy fallback, handoff is the graceful relay.',
     inputSchema: proposeSessionHandoffInputSchema,
     handler: handleProposeSessionHandoff,
+  },
+  // F231 Phase C: Cat-initiated profile-update proposal (operator approves before the primer is written)
+  {
+    name: 'cat_cafe_propose_profile_update',
+    description:
+      'Propose an update to YOUR OWN per-cat relationship primer (relationship/{yourCatId}-primer.md) — the "养熟循环" digest entry point (F231 KD-12). ' +
+      'Returns a proposalId, NOT a written file: the primer is only written after the operator approves the confirmation card (reject/expire = nothing changes). ' +
+      'Use when you have observed a STABLE relationship signal worth persisting — a durable operator preference, communication style, working boundary, or a fact the operator explicitly asked you to remember — not for one-off context. ' +
+      'afterContent is the COMPLETE new primer (whole-file replacement, not a diff) — include everything you want kept. ' +
+      'The target is ALWAYS your own per-cat primer, derived server-side from your authenticated identity — you cannot target another cat or the shared capsule (capsule promotion is a later phase). ' +
+      'Use sparingly: propose when a signal has clearly stabilized, not on every interaction. signalKind records provenance: cat-declared (you inferred it) vs cvo-instructed (the operator told you to).',
+    inputSchema: proposeProfileUpdateInputSchema,
+    handler: handleProposeProfileUpdate,
   },
   // ============ F155: Guide Engine ============
   {

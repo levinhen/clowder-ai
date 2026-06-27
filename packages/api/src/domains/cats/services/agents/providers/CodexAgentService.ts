@@ -4,7 +4,7 @@
  *
  * CLI 调用方式:
  *   codex exec --json --sandbox danger-full-access --add-dir .git --config approval_policy="on-request" "prompt"
- *   codex exec resume SESSION_ID --json --config approval_policy="on-request" "prompt"
+ *   codex exec resume SESSION_ID --json --config sandbox_mode="danger-full-access" --config approval_policy="on-request" "prompt"
  *
  * NDJSON 事件格式:
  *   thread.started  → session_init (含 thread_id)
@@ -22,6 +22,7 @@ import { type CatId, createCatId } from '@cat-cafe/shared';
 import { getCatContextWindowConfig, getCatEffort } from '../../../../../config/cat-config-loader.js';
 import { getCatModel } from '../../../../../config/cat-models.js';
 import { getCodexApprovalPolicy, getCodexSandboxMode } from '../../../../../config/codex-cli.js';
+import { estimateCostFromTokens } from '../../../../../config/model-pricing.js';
 import { createModuleLogger } from '../../../../../infrastructure/logger.js';
 import { formatCliExitError } from '../../../../../utils/cli-format.js';
 import { formatCliNotFoundError, resolveCliCommand } from '../../../../../utils/cli-resolve.js';
@@ -220,6 +221,7 @@ const CAT_CAFE_MCP_SERVER_ENTRIES = [
   ['cat-cafe-memory', 'memory.js'],
   ['cat-cafe-signals', 'signals.js'],
   ['cat-cafe-limb', 'limb.js'],
+  ['cat-cafe-audio', 'audio.js'],
   ['cat-cafe-finance', 'finance.js'],
 ] as const;
 const CAT_CAFE_MCP_CALLBACK_ENV_KEYS = [
@@ -259,7 +261,7 @@ function pushCatCafeMcpEnvConfig(
 
 function buildCatCafeMcpConfigArgs(workingDirectory?: string, callbackEnv?: Record<string, string>): string[] {
   const fileDir = dirname(fileURLToPath(import.meta.url));
-  // The thread workingDirectory is the user's project/workspace. Cat Cafe MCP
+  // The thread workingDirectory is the user's project/workspace. Clowder AI MCP
   // binaries are runtime-owned, so resolving from workingDirectory can pick a
   // fork checkout with incomplete node_modules and silently drop all MCP tools.
   const candidateRoots = [
@@ -388,6 +390,20 @@ export class CodexAgentService implements AgentService {
   }
 
   /**
+   * F177 Phase H (KD-13) — codex-family runs via `codex exec --json`, which does
+   * NOT dispatch ~/.codex/hooks.json Stop hooks (H0 spike 2026-06-11), so the
+   * Claude Code F177-G routing guard never fires for codex/gpt52. The serial
+   * route layer applies a server-side remedial guard instead. Covers all
+   * CodexAgentService instances (codex GPT-5.5 + gpt52 GPT-5.4).
+   *
+   * NOTE: do NOT derive this from injectsL0Natively() — codex injects L0
+   * natively yet still needs the guard, so the two capabilities are orthogonal.
+   */
+  needsServerRoutingGuard(): boolean {
+    return true;
+  }
+
+  /**
    * F203 Phase C: compile per-cat L0 → `-c developer_instructions=` argv
    * (S4-verified, 砚砚 62b9255e2 — enters the OpenAI `developer` role,
    * additive, NOT replacing Codex's base instructions; per-invocation argv,
@@ -421,6 +437,7 @@ export class CodexAgentService implements AgentService {
     const approvalPolicy = getCodexApprovalPolicy();
     const effortLevel = getCatEffort(this.catId as string, undefined, 'openai');
     const reasoningArgs = ['--config', `model_reasoning_effort="${effortLevel}"`];
+    const sandboxConfigArgs = ['--config', `sandbox_mode=${toTomlString(sandboxMode)}`];
     const approvalArgs = ['--config', `approval_policy="${approvalPolicy}"`];
     const ctxConfig = getCatContextWindowConfig(this.catId as string);
     const contextWindowArgs: string[] = ctxConfig
@@ -514,10 +531,12 @@ export class CodexAgentService implements AgentService {
     }
     const developerInstructionsArgs = l0Result.args;
 
-    // resume 子命令不接受 --sandbox（sandbox 在创建时已锁定）
+    // resume 子命令不接受 --sandbox / --add-dir, but it does accept
+    // sandbox_mode through --config. Replay the configured sandbox there so
+    // resumed Codex turns cannot drift back to a CLI default sandbox on Windows.
     // --add-dir .git: 允许写入 .git/ 目录（index.lock、objects、refs），解锁 git commit
-    // 注意：旧 session resume 时沿用创建时的沙箱参数，不会带 --add-dir。
-    // 这是预期行为——新建会话即可获得 .git 写入权限。
+    // 注意：旧 session resume 时仍不会带 --add-dir。这是预期行为——新建会话
+    // 才能获得额外目录授权。
     // Incident 2026-05-29 (cross-thread-context-contamination): prompt 正文经 stdin
     // 传入（见下方 cliOpts.stdinInput），绝不进 argv —— 否则 `ps -o command=` /
     // /proc/<pid>/cmdline 会把完整对话历史（含跨 thread/猫/用户内容）暴露给任何
@@ -552,6 +571,7 @@ export class CodexAgentService implements AgentService {
           ...dedup(modelArgs),
           ...dedup(reasoningArgs),
           ...dedup(contextWindowArgs),
+          ...dedup(sandboxConfigArgs),
           ...dedup(approvalArgs),
           ...dedup(developerInstructionsArgs),
           ...dedup(customProviderArgs),
@@ -890,6 +910,30 @@ export class CodexAgentService implements AgentService {
         }
       }
 
+      // Estimate cost from pricing table when CLI doesn't provide costUsd.
+      // MUST run BEFORE contextSnapshotResolver — the resolver overwrites
+      // metadata.usage.inputTokens/outputTokens with context-fill values for
+      // display, but cost estimation needs the original turn.completed totals
+      // which reflect cumulative billing (cloud P2 fix).
+      // Use metadata.model (= effectiveModel = actual model that ran) rather than
+      // getCatModel() which misses per-invocation overrides (review P1-2).
+      if (metadata.usage && metadata.usage.costUsd == null && metadata.model) {
+        const inputTokens = metadata.usage.inputTokens ?? metadata.usage.lastTurnInputTokens ?? 0;
+        const outputTokens = metadata.usage.outputTokens ?? 0;
+        if (inputTokens > 0 || outputTokens > 0) {
+          const estimated = estimateCostFromTokens(
+            metadata.model,
+            inputTokens,
+            outputTokens,
+            metadata.usage.cacheReadTokens,
+          );
+          if (estimated != null) {
+            metadata.usage.costUsd = estimated;
+            metadata.usage.costEstimated = true;
+          }
+        }
+      }
+
       if (metadata.sessionId) {
         try {
           const snapshot = await this.contextSnapshotResolver(metadata.sessionId);
@@ -900,7 +944,7 @@ export class CodexAgentService implements AgentService {
             usage.lastTurnInputTokens = snapshot.contextUsedTokens;
             // Codex turn.completed usage can be CLI-session cumulative. When
             // token_count is available, prefer last_token_usage for this turn.
-            // For Codex, each Cat Cafe invocation is one CLI turn, so
+            // For Codex, each Clowder AI invocation is one CLI turn, so
             // last_token_usage is the invocation input, not a session total.
             usage.inputTokens = snapshot.contextUsedTokens;
 

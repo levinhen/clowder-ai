@@ -12,7 +12,7 @@ export const DEVELOPMENT_SOP_DEFINITION = {
   id: 'development',
   domain: 'engineering',
   label: 'Development SOP',
-  description: 'Cat Cafe coding feature lifecycle. This is the runtime SOP definition used by WorkflowSop.',
+  description: 'Clowder AI coding feature lifecycle. This is the runtime SOP definition used by WorkflowSop.',
   stages: [
     {
       id: 'kickoff',
@@ -27,7 +27,8 @@ export const DEVELOPMENT_SOP_DEFINITION = {
           owner: { type: 'stage_suggested_skill', skill: 'feat-lifecycle' },
           predicate: {
             type: 'manual_only',
-            reason: 'Feature spec completeness is reviewed from docs and CVO context; no stable machine artifact yet.',
+            reason:
+              'Feature spec completeness is reviewed from docs and operator context; no stable machine artifact yet.',
           },
         },
       ],
@@ -35,12 +36,12 @@ export const DEVELOPMENT_SOP_DEFINITION = {
         {
           id: 'kickoff-no-unconfirmed-implementation',
           kind: 'pitfall',
-          text: '没有铲屎官确认就直接开始实现',
+          text: '没有co-creator确认就直接开始实现',
           severity: 'warn',
           owner: { type: 'stage_suggested_skill', skill: 'feat-lifecycle' },
           predicate: {
             type: 'manual_only',
-            reason: 'CVO confirmation is conversational intent, not yet represented as a structured event.',
+            reason: 'operator confirmation is conversational intent, not yet represented as a structured event.',
           },
         },
       ],
@@ -95,6 +96,18 @@ export const DEVELOPMENT_SOP_DEFINITION = {
             type: 'manual_only',
             reason: 'Current runtime has no stable post-compact recall-failure telemetry.',
             futureCandidate: 'trace_pattern_post_compact_recall',
+          },
+        },
+        {
+          id: 'impl-convention-graph-before-convention-edit',
+          kind: 'pitfall',
+          text: '改 MCP tool / skill manifest / route / callback 等约定面前，先用 convention graph 查影响面；stale=true 先 reindex',
+          severity: 'warn',
+          owner: { type: 'stage_suggested_skill', skill: 'writing-plans' },
+          predicate: {
+            type: 'manual_only',
+            reason: 'Convention graph CLI usage is not yet emitted as structured telemetry.',
+            futureCandidate: 'convention_graph_usage_event',
           },
         },
       ],

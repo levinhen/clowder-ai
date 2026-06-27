@@ -1,7 +1,7 @@
 // @ts-check
 
 import assert from 'node:assert/strict';
-import { chmod, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { chmod, lstat, mkdir, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { homedir, tmpdir } from 'node:os';
 import { join, sep } from 'node:path';
 import { afterEach, beforeEach, describe, it } from 'node:test';
@@ -10,6 +10,7 @@ import './helpers/setup-cat-registry.js';
 import {
   bootstrapCapabilities,
   buildCatCafeMcpDescriptor,
+  __testing as capabilityOrchestratorTesting,
   comparePencilDirs,
   deduplicateDiscoveredMcpServers,
   discoverExternalMcpServers,
@@ -61,7 +62,7 @@ describe('readCapabilitiesConfig', () => {
     await rm(dir, { recursive: true, force: true });
   });
 
-  it('reads valid capabilities.json', async () => {
+  it('reads valid v1 capabilities.json as migrated v2 config', async () => {
     await mkdir(join(dir, '.cat-cafe'), { recursive: true });
     await writeFile(
       join(dir, '.cat-cafe', 'capabilities.json'),
@@ -80,7 +81,7 @@ describe('readCapabilitiesConfig', () => {
 
     const config = await readCapabilitiesConfig(dir);
     assert.ok(config);
-    assert.equal(config.version, 1);
+    assert.equal(config.version, 2);
     assert.equal(config.capabilities.length, 1);
     assert.equal(config.capabilities[0].id, 'cat-cafe');
   });
@@ -260,7 +261,7 @@ describe('writeCapabilitiesConfig', () => {
 
     await writeCapabilitiesConfig(dir, config);
     const read = await readCapabilitiesConfig(dir);
-    assert.deepEqual(read, config);
+    assert.deepEqual(read, { ...config, version: 2 });
   });
 });
 
@@ -733,9 +734,9 @@ describe('bootstrapCapabilities', () => {
       geminiConfig: join(dir, 'nonexistent.json'),
     });
 
-    assert.equal(config.version, 1);
-    // F193/F207 split-only — 5 split servers (collab/memory/signals/limb/finance) + filesystem.
-    assert.equal(config.capabilities.length, 6);
+    assert.equal(config.version, 2);
+    // F193/F195/F207 split-only — 6 split servers (collab/memory/signals/limb/audio/finance) + filesystem.
+    assert.equal(config.capabilities.length, 7);
 
     // F193 Phase C: NO all-in-one main server in fresh installs
     const catCafeMain = config.capabilities.find((c) => c.id === 'cat-cafe');
@@ -760,6 +761,11 @@ describe('bootstrapCapabilities', () => {
     assert.equal(catCafeLimb.source, 'cat-cafe');
     assert.equal(catCafeLimb.enabled, true);
 
+    const catCafeAudio = config.capabilities.find((c) => c.id === 'cat-cafe-audio');
+    assert.ok(catCafeAudio, 'F195: bootstrap must include cat-cafe-audio');
+    assert.equal(catCafeAudio.source, 'cat-cafe');
+    assert.equal(catCafeAudio.enabled, true);
+
     const catCafeFinance = config.capabilities.find((c) => c.id === 'cat-cafe-finance');
     assert.ok(catCafeFinance, 'F207 Phase B0: bootstrap must include cat-cafe-finance');
     assert.equal(catCafeFinance.source, 'cat-cafe');
@@ -772,7 +778,7 @@ describe('bootstrapCapabilities', () => {
     // Also persisted to disk
     const persisted = await readCapabilitiesConfig(dir);
     assert.ok(persisted);
-    assert.equal(persisted.capabilities.length, 6);
+    assert.equal(persisted.capabilities.length, 7);
   });
 
   it('normalizes pencil into a resolver-backed capability on bootstrap', async () => {
@@ -782,7 +788,8 @@ describe('bootstrapCapabilities', () => {
       JSON.stringify({
         mcpServers: {
           pencil: {
-            command: '/home/user/mcp-server-darwin-arm64',
+            command:
+              '/home/user/.antigravity/extensions/highagency.pencildev-0.6.32-universal/out/mcp-server-darwin-arm64',
             args: ['--app', 'antigravity'],
           },
         },
@@ -827,6 +834,7 @@ describe('bootstrapCapabilities', () => {
     assert.ok(config.capabilities.find((c) => c.id === 'cat-cafe-memory'));
     assert.ok(config.capabilities.find((c) => c.id === 'cat-cafe-signals'));
     assert.ok(config.capabilities.find((c) => c.id === 'cat-cafe-limb'));
+    assert.ok(config.capabilities.find((c) => c.id === 'cat-cafe-audio'));
     assert.ok(config.capabilities.find((c) => c.id === 'cat-cafe-finance'));
   });
 
@@ -847,7 +855,14 @@ describe('bootstrapCapabilities', () => {
       );
 
       // F193 Phase C: split-only — no legacy 'cat-cafe' all-in-one
-      const allIds = ['cat-cafe-collab', 'cat-cafe-memory', 'cat-cafe-signals', 'cat-cafe-limb', 'cat-cafe-finance'];
+      const allIds = [
+        'cat-cafe-collab',
+        'cat-cafe-memory',
+        'cat-cafe-signals',
+        'cat-cafe-limb',
+        'cat-cafe-audio',
+        'cat-cafe-finance',
+      ];
       for (const id of allIds) {
         const cap = config.capabilities.find((c) => c.id === id);
         assert.ok(cap, `${id} should exist after bootstrap`);
@@ -1020,7 +1035,8 @@ describe('migrateResolverBackedCapabilities', () => {
         enabled: true,
         source: 'external',
         mcpServer: {
-          command: '/home/user/mcp-server-darwin-arm64',
+          command:
+            '/home/user/.antigravity/extensions/highagency.pencildev-0.6.32-universal/out/mcp-server-darwin-arm64',
           args: ['--app', 'antigravity'],
         },
       },
@@ -1086,6 +1102,12 @@ describe('ensureCatCafeMainServer (F193 Phase C semantics)', () => {
     assert.equal(limb.source, 'cat-cafe');
     assert.ok(limb.mcpServer?.args[0].includes('limb.js'));
 
+    const audio = result.config.capabilities.find((c) => c.id === 'cat-cafe-audio');
+    assert.ok(audio, 'F195: cat-cafe-audio must be added');
+    assert.equal(audio.type, 'mcp');
+    assert.equal(audio.source, 'cat-cafe');
+    assert.ok(audio.mcpServer?.args[0].includes('audio.js'));
+
     const finance = result.config.capabilities.find((c) => c.id === 'cat-cafe-finance');
     assert.ok(finance, 'F207 Phase B0: cat-cafe-finance must be added');
     assert.equal(finance.type, 'mcp');
@@ -1122,6 +1144,9 @@ describe('ensureCatCafeMainServer (F193 Phase C semantics)', () => {
     assert.equal(result.migrated, true);
     const limb = result.config.capabilities.find((c) => c.id === 'cat-cafe-limb');
     assert.ok(limb, 'F193 Phase C: cat-cafe-limb must be added to 3-split install');
+
+    const audio = result.config.capabilities.find((c) => c.id === 'cat-cafe-audio');
+    assert.ok(audio, 'F195: cat-cafe-audio must be added to 3-split install');
 
     const finance = result.config.capabilities.find((c) => c.id === 'cat-cafe-finance');
     assert.ok(finance, 'F207 Phase B0: cat-cafe-finance must be added to 3-split install');
@@ -1173,6 +1198,7 @@ describe('ensureCatCafeMainServer (F193 Phase C semantics)', () => {
       undefined,
     );
     assert.ok(result.config.capabilities.find((c) => c.id === 'cat-cafe-limb'));
+    assert.ok(result.config.capabilities.find((c) => c.id === 'cat-cafe-audio'));
     assert.ok(result.config.capabilities.find((c) => c.id === 'cat-cafe-finance'));
   });
 
@@ -1269,6 +1295,13 @@ describe('ensureCatCafeMainServer (F193 Phase C semantics)', () => {
     );
     assert.equal(limb.mcpServer?.workingDir, '/legacy-dir', 'limb must inherit workingDir from legacy cat-cafe');
 
+    const audio = result.config.capabilities.find((c) => c.id === 'cat-cafe-audio');
+    assert.ok(audio, 'audio must be added');
+    assert.equal(audio.enabled, false, 'audio must inherit DISABLED from legacy cat-cafe');
+    assert.deepEqual(audio.overrides, [{ catId: 'opus-47', enabled: true }]);
+    assert.deepEqual(audio.mcpServer?.env, { CAT_CAFE_LIMB_TOKEN: 'legacy-token' });
+    assert.equal(audio.mcpServer?.workingDir, '/legacy-dir');
+
     const finance = result.config.capabilities.find((c) => c.id === 'cat-cafe-finance');
     assert.ok(finance, 'finance must be added');
     assert.equal(finance.enabled, false, 'finance must inherit DISABLED from legacy cat-cafe');
@@ -1277,7 +1310,7 @@ describe('ensureCatCafeMainServer (F193 Phase C semantics)', () => {
     assert.equal(finance.mcpServer?.workingDir, '/legacy-dir');
   });
 
-  it('no-op when 5-split is already canonical (no main, all 5 splits present)', () => {
+  it('no-op when 6-split is already canonical (no main, all 6 splits present)', () => {
     // R5 P3: ensure fixture actually exercises canonical split path,
     // not the partial-split early return.
     const config = makeConfig([
@@ -1310,6 +1343,13 @@ describe('ensureCatCafeMainServer (F193 Phase C semantics)', () => {
         mcpServer: { command: 'node', args: ['limb.js'] },
       },
       {
+        id: 'cat-cafe-audio',
+        type: 'mcp',
+        enabled: true,
+        source: 'cat-cafe',
+        mcpServer: { command: 'node', args: ['audio.js'] },
+      },
+      {
         id: 'cat-cafe-finance',
         type: 'mcp',
         enabled: true,
@@ -1321,7 +1361,7 @@ describe('ensureCatCafeMainServer (F193 Phase C semantics)', () => {
     const result = ensureCatCafeMainServer(config, { projectRoot: '/repo' });
     assert.equal(result.migrated, false);
     // Sanity check: no entries removed/added in canonical state
-    assert.equal(result.config.capabilities.length, 5);
+    assert.equal(result.config.capabilities.length, 6);
   });
 
   // Cloud round 4 P1 (PR #1605): if external cat-cafe-limb blocks managed
@@ -2221,6 +2261,45 @@ describe('generateCliConfigs', () => {
     assert.ok(configCount > 0, 'At least one CLI config should be generated');
   });
 
+  it('restores CLI config file permissions during rollback', async () => {
+    const configPath = join(dir, '.mcp.json');
+    const originalUmask = process.umask(0o022);
+    try {
+      await writeFile(configPath, '{"mcpServers":{"secret":{"command":"old","args":[]}}}\n', { mode: 0o600 });
+      const snapshot = await capabilityOrchestratorTesting.snapshotCliConfigPath(configPath);
+
+      await rm(configPath);
+      await capabilityOrchestratorTesting.restoreCliConfigPath(configPath, snapshot);
+
+      const restoredMode = (await stat(configPath)).mode & 0o777;
+      assert.equal(restoredMode, 0o600, 'rollback should preserve strict config file permissions');
+    } finally {
+      process.umask(originalUmask);
+    }
+  });
+
+  it('restores symlinked CLI config targets during rollback', async () => {
+    const configPath = join(dir, '.mcp.json');
+    const targetPath = join(dir, 'dotfiles', 'claude-mcp.json');
+    const originalContent = '{"mcpServers":{"secret":{"command":"old","args":[]}}}\n';
+    const originalUmask = process.umask(0o022);
+    try {
+      await mkdir(join(dir, 'dotfiles'), { recursive: true });
+      await writeFile(targetPath, originalContent, { mode: 0o600 });
+      await symlink(targetPath, configPath);
+
+      const snapshot = await capabilityOrchestratorTesting.snapshotCliConfigPath(configPath);
+      await writeFile(configPath, '{"mcpServers":{"cat-cafe":{"command":"node","args":["new.js"]}}}\n');
+      await capabilityOrchestratorTesting.restoreCliConfigPath(configPath, snapshot);
+
+      assert.equal(await readFile(targetPath, 'utf-8'), originalContent);
+      assert.equal((await stat(targetPath)).mode & 0o777, 0o600);
+      assert.equal((await lstat(configPath)).isSymbolicLink(), true, 'rollback should preserve the symlink path');
+    } finally {
+      process.umask(originalUmask);
+    }
+  });
+
   it('removes managed commandless entries from Gemini settings', async () => {
     const hasGoogleCat = catRegistry.getAllIds().some((id) => {
       const entry = catRegistry.tryGet(id);
@@ -2594,6 +2673,13 @@ describe('healCatCafeMcpTopology (F193 Phase C shared migration chain)', () => {
         mcpServer: { command: 'node', args: ['/root/packages/mcp-server/dist/limb.js'] },
       },
       {
+        id: 'cat-cafe-audio',
+        type: 'mcp',
+        enabled: true,
+        source: 'cat-cafe',
+        mcpServer: { command: 'node', args: ['/root/packages/mcp-server/dist/audio.js'] },
+      },
+      {
         id: 'cat-cafe-finance',
         type: 'mcp',
         enabled: true,
@@ -2603,8 +2689,8 @@ describe('healCatCafeMcpTopology (F193 Phase C shared migration chain)', () => {
     ]);
 
     const result = healCatCafeMcpTopology(config, { catCafeRepoRoot: '/root' });
-    assert.equal(result.migrated, false, 'canonical 5-split must be no-op');
-    assert.equal(result.config.capabilities.length, 5);
+    assert.equal(result.migrated, false, 'canonical 6-split must be no-op');
+    assert.equal(result.config.capabilities.length, 6);
   });
 
   it('migrated flag aggregates from all 4 chain steps', () => {
@@ -2725,7 +2811,7 @@ describe('orchestrate', () => {
     );
 
     assert.ok(config);
-    assert.equal(config.version, 1);
+    assert.equal(config.version, 2);
     // At minimum, split cat-cafe MCP servers should be present
     assert.ok(config.capabilities.find((c) => c.id === 'cat-cafe-collab'));
     assert.ok(config.capabilities.find((c) => c.id === 'cat-cafe-memory'));
@@ -2776,7 +2862,8 @@ describe('orchestrate', () => {
           enabled: true,
           source: 'external',
           mcpServer: {
-            command: '/home/user/mcp-server-darwin-arm64',
+            command:
+              '/home/user/.antigravity/extensions/highagency.pencildev-0.6.32-universal/out/mcp-server-darwin-arm64',
             args: ['--app', 'antigravity'],
           },
         },

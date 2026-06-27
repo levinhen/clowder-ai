@@ -7,8 +7,14 @@ import type { ConnectorSource } from '@cat-cafe/shared';
 import { parsePrSubjectKey, prSubjectKey } from '@cat-cafe/shared';
 import type { FastifyBaseLogger } from 'fastify';
 import type { ITaskStore } from '../../domains/cats/services/stores/ports/TaskStore.js';
+import type { ICommunityEventLog } from '../../domains/community/CommunityEventLog.js';
 import type { ConnectorDeliveryDeps } from './deliver-connector-message.js';
 import { deliverConnectorMessage } from './deliver-connector-message.js';
+
+/** Minimal projector interface for optional DI — avoids importing concrete class. */
+interface ICommunityProjectorMin {
+  apply(event: Parameters<ICommunityEventLog['append']>[0]): Promise<void>;
+}
 
 export type CiBucket = 'pass' | 'fail' | 'pending';
 
@@ -46,6 +52,21 @@ export interface CiCdRouterOptions {
     outcome: 'success' | 'failure';
     threadId: string;
   }) => void;
+  /**
+   * F168 Phase A (P1-3 fix): canonical PR lifecycle event emission point.
+   * CiCdRouter is first to detect merged/closed; ReviewFeedbackTaskSpec may race.
+   * sourceEventId dedup ensures double-fire is safe.
+   */
+  readonly eventLog?: ICommunityEventLog;
+  /** Optional projector to apply the emitted event immediately after append. */
+  readonly projector?: ICommunityProjectorMin;
+  /**
+   * F208 Phase E AC-E2: distillation checkpoint for feat-phase-close.
+   * CiCdRouter is the canonical first-detection point for PR merge — wire here
+   * so the checkpoint fires even when ReviewFeedbackTaskSpec gate filters done tasks.
+   * Idempotent (sourceId dedup) so double-fire from both paths is safe.
+   */
+  readonly distillationCheckpoint?: import('../../infrastructure/distillation/DistillationCheckpoint.js').DistillationCheckpoint;
 }
 
 export class CiCdRouter {
@@ -92,6 +113,61 @@ export class CiCdRouter {
           });
         } catch {
           // Best-effort: don't break CI/CD routing
+        }
+      }
+
+      // F208 AC-E2: distillation checkpoint on feat-phase-close (best-effort, merge only).
+      // CiCdRouter is the canonical first-detection point for merge — checkpoint MUST fire here
+      // because ReviewFeedbackTaskSpec gate filters done tasks and may miss.
+      // sourceId dedup makes double-fire from ReviewFeedbackTaskSpec safe.
+      if (poll.prState === 'merged' && this.opts.distillationCheckpoint) {
+        try {
+          // Extract featureId from trackingInstructions (prTitle not available here)
+          const featureSource = task.automationState?.trackingInstructions ?? task.title ?? '';
+          const featureMatch = featureSource.match(/\b[Ff](\d{2,4})\b/);
+          const featureId = featureMatch ? `F${featureMatch[1]}` : undefined;
+          if (featureId) {
+            const phaseMatch = featureSource.match(/[Pp]hase\s+([A-Z])/i);
+            await this.opts.distillationCheckpoint.onFeatPhaseClose({
+              prNumber: poll.prNumber,
+              repoFullName: poll.repoFullName,
+              authorCatId: (task.ownerCatId ?? 'unknown') as string,
+              threadId: task.threadId,
+              featureId,
+              phaseLabel: phaseMatch?.[1] ?? 'unknown',
+            });
+          }
+        } catch {
+          log.warn(
+            `[CiCdRouter] distillation checkpoint (feat-phase-close) failed for ${poll.repoFullName}#${poll.prNumber}`,
+          );
+        }
+      }
+
+      // F168 Phase A P1-3: canonical community event emission.
+      // This is the first reliable detection point for PR lifecycle.
+      // sourceEventId = `lifecycle:${sk}:${prState}` — dedup-safe if ReviewFeedbackTaskSpec also fires.
+      if (this.opts.eventLog) {
+        try {
+          const eventKind = poll.prState === 'merged' ? 'pr.merged' : 'pr.closed';
+          const communityEvent = {
+            sourceEventId: `lifecycle:${sk}:${poll.prState}`,
+            subjectKey: sk,
+            kind: eventKind as 'pr.merged' | 'pr.closed',
+            classification: 'state-changing' as const,
+            payload: {
+              prState: poll.prState,
+              repoFullName: poll.repoFullName,
+              prNumber: poll.prNumber,
+            },
+            at: Date.now(),
+          };
+          const { appended } = await this.opts.eventLog.append(communityEvent);
+          if (appended && this.opts.projector) {
+            await this.opts.projector.apply(communityEvent);
+          }
+        } catch {
+          // Best-effort: event log failure MUST NOT block CI/CD routing (spec §Task6)
         }
       }
 

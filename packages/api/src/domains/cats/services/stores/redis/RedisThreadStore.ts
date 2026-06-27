@@ -10,7 +10,7 @@
  * 默认持久化；用户可见状态禁止默认 TTL（LL-048）。
  */
 
-import type { CatId, ThreadPhase } from '@cat-cafe/shared';
+import type { CatId, ThreadKind, ThreadPhase } from '@cat-cafe/shared';
 import { generateThreadId } from '@cat-cafe/shared';
 import type { RedisClient } from '@cat-cafe/shared/utils';
 import type {
@@ -578,6 +578,16 @@ export class RedisThreadStore implements IThreadStore {
     }
   }
 
+  /** F229 / F167: Set or clear threadKind marker for concierge / gate-keeping thread. */
+  async updateThreadKind(threadId: string, kind: ThreadKind | null): Promise<void> {
+    const key = ThreadKeys.detail(threadId);
+    if (kind === null) {
+      await this.deleteDetailFields(key, 'threadKind');
+    } else {
+      await this.setDetailFields(key, 'threadKind', kind);
+    }
+  }
+
   async updateConnectorHubState(threadId: string, state: ConnectorHubStateV1 | null): Promise<void> {
     const key = ThreadKeys.detail(threadId);
     if (state === null) {
@@ -589,7 +599,7 @@ export class RedisThreadStore implements IThreadStore {
 
   async updatePreferredWorkspaceMode(
     threadId: string,
-    mode: 'dev' | 'recall' | 'schedule' | 'tasks' | 'community' | null,
+    mode: 'dev' | 'recall' | 'schedule' | 'tasks' | 'community' | 'artifacts' | 'approval' | 'trajectory' | null,
   ): Promise<void> {
     const key = ThreadKeys.detail(threadId);
     if (mode === null) {
@@ -1055,6 +1065,11 @@ export class RedisThreadStore implements IThreadStore {
     if (thread.labels && thread.labels.length > 0) {
       result.labels = JSON.stringify(thread.labels);
     }
+    // F229: Concierge thread marker (set separately via updateThreadKind; also persisted here for
+    // cold-create paths where the full thread object is serialized before updateThreadKind is called)
+    if (thread.threadKind) {
+      result.threadKind = thread.threadKind;
+    }
     return result;
   }
 
@@ -1193,7 +1208,16 @@ export class RedisThreadStore implements IThreadStore {
         /* ignore malformed JSON */
       }
     }
-    const validModes = new Set(['dev', 'recall', 'schedule', 'tasks', 'community']);
+    const validModes = new Set([
+      'dev',
+      'recall',
+      'schedule',
+      'tasks',
+      'community',
+      'artifacts',
+      'approval',
+      'trajectory',
+    ]);
     if (data.preferredWorkspaceMode && validModes.has(data.preferredWorkspaceMode)) {
       result.preferredWorkspaceMode = data.preferredWorkspaceMode as Thread['preferredWorkspaceMode'];
     }
@@ -1206,6 +1230,10 @@ export class RedisThreadStore implements IThreadStore {
       } catch {
         /* ignore malformed JSON */
       }
+    }
+    // F229 / F167: Restore thread kind marker (written by updateThreadKind; validate value)
+    if (data.threadKind === 'concierge' || data.threadKind === 'gate-keeping') {
+      result.threadKind = data.threadKind;
     }
     return result;
   }

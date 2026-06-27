@@ -24,7 +24,7 @@ import {
  * Renders structured `cliDiagnostics` payload built by Phase A:
  *  - Always-visible banner with reasonCode-driven icon + publicSummary + publicHint
  *  - Collapsible safeExcerpt (only if Phase A populated it — KD-1 white-list admission)
- *  - debugRef metadata strip (command / exit / signal / invocationId)
+ *  - debugRef metadata strip (command / exit / signal / invocationId / path-safe provider context)
  *
  * Visual contract mirrors `TimeoutDiagnosticsPanel` (F118 AC-C3) — same error-banner +
  * collapsible-detail pattern, but per-reasonCode palette + icon for at-a-glance scan.
@@ -117,6 +117,13 @@ const UNKNOWN_PALETTE: Palette = { ...PALETTE_SYSTEM, Icon: UnknownReasonIcon };
  */
 const KNOWN_EXCERPT_SOURCES: ReadonlySet<string> = new Set(['classifier', 'cc_structured', 'unknown_raw']);
 
+const DEBUG_REF_CONTEXT_FIELDS = [
+  ['homeMode', 'homeMode'],
+  ['spawnCwdMode', 'spawnCwdMode'],
+  ['spawnCwdKey', 'spawnCwdKey'],
+  ['profileId', 'profileId'],
+] as const satisfies readonly [keyof CliDiagnostics['debugRef'], string][];
+
 /**
  * 云端 codex P2 (2026-05-27): persisted/hydrated `cliDiagnostics.reasonCode` may carry
  * a stale, newer, or malformed string (older web fetches a newer-api error; rollback
@@ -144,7 +151,7 @@ function truncateMiddle(s: string, max = 32): string {
 
 /**
  * 云端 codex P2-5 (2026-05-27): backend `resolveCliCommand()` may resolve to an
- * absolute path (e.g. `/home/user/codex` from `which` fallback), and
+ * absolute path (e.g. `/home/user/.npm/bin/codex` from `which` fallback), and
  * the api-side sanitizer redacts HOME/USERPROFILE only inside stderr — not the
  * structured `debugRef.command`. Mirror the same redaction on the frontend before
  * rendering so the debug strip can't leak host install paths.
@@ -288,6 +295,14 @@ export function CliDiagnosticsPanel({ errorMessage, diagnostics, dedupCount }: C
             <span className="font-medium">invocationId:</span> {truncateMiddle(diagnostics.debugRef.invocationId, 32)}
           </span>
         )}
+        {DEBUG_REF_CONTEXT_FIELDS.map(([key, label]) => {
+          const value = diagnostics.debugRef[key];
+          return value ? (
+            <span key={key}>
+              <span className="font-medium">{label}:</span> {String(value)}
+            </span>
+          ) : null;
+        })}
       </div>
     </div>
   );

@@ -28,8 +28,30 @@ describe('resolveAcpMcpServers', () => {
     temps.length = 0;
   });
 
-  it('returns [] for empty whitelist', () => {
-    const result = resolveAcpMcpServers('/nonexistent', []);
+  it('auto-provisions all built-in cat-cafe servers when whitelist is empty (F161)', () => {
+    const root = makeTempRoot(); // no .mcp.json
+    const result = resolveAcpMcpServers(root, []);
+    // All 6 built-in cat-cafe servers should be auto-provisioned
+    const names = result.map((s) => s.name);
+    assert.ok(names.includes('cat-cafe'), 'should include cat-cafe');
+    assert.ok(names.includes('cat-cafe-collab'), 'should include cat-cafe-collab');
+    assert.ok(names.includes('cat-cafe-memory'), 'should include cat-cafe-memory');
+    assert.ok(names.includes('cat-cafe-signals'), 'should include cat-cafe-signals');
+    assert.ok(names.includes('cat-cafe-limb'), 'should include cat-cafe-limb');
+    assert.ok(names.includes('cat-cafe-audio'), 'should include cat-cafe-audio');
+    assert.ok(names.includes('cat-cafe-finance'), 'should include cat-cafe-finance');
+    assert.equal(result.length, 7);
+    // Each server should be a valid stdio config
+    for (const s of result) {
+      assert.equal(s.command, 'node');
+      assert.ok(s.args[0].includes('packages/mcp-server/dist/'));
+    }
+  });
+
+  it('keeps MCP servers empty when member-level mcpSupport is disabled', () => {
+    const root = makeTempRoot(); // no .mcp.json
+    const result = resolveAcpMcpServers(root, [], undefined, { mcpSupport: false });
+
     assert.deepStrictEqual(result, []);
   });
 
@@ -136,6 +158,16 @@ describe('resolveAcpMcpServers — builtin auto-provision (F145 Phase C)', () =>
     assert.ok(result[0].args[0].endsWith('packages/mcp-server/dist/limb.js'));
   });
 
+  it('auto-generates cat-cafe-audio from projectRoot (F195)', () => {
+    const root = makeTempRoot(); // no .mcp.json
+    const result = resolveAcpMcpServers(root, ['cat-cafe-audio']);
+
+    assert.equal(result.length, 1);
+    assert.equal(result[0].name, 'cat-cafe-audio');
+    assert.equal(result[0].command, 'node');
+    assert.ok(result[0].args[0].endsWith('packages/mcp-server/dist/audio.js'));
+  });
+
   it('auto-generates cat-cafe-finance from projectRoot (F207 Phase B0)', () => {
     const root = makeTempRoot(); // no .mcp.json
     const result = resolveAcpMcpServers(root, ['cat-cafe-finance']);
@@ -146,28 +178,30 @@ describe('resolveAcpMcpServers — builtin auto-provision (F145 Phase C)', () =>
     assert.ok(result[0].args[0].endsWith('packages/mcp-server/dist/finance.js'));
   });
 
-  it('auto-generates all canonical 5-split builtins (F193/F207)', () => {
+  it('auto-generates all canonical 6-split builtins (F193/F195/F207)', () => {
     const root = makeTempRoot(); // no .mcp.json
     const result = resolveAcpMcpServers(root, [
       'cat-cafe-collab',
       'cat-cafe-memory',
       'cat-cafe-signals',
       'cat-cafe-limb',
+      'cat-cafe-audio',
       'cat-cafe-finance',
     ]);
 
-    assert.equal(result.length, 5);
+    assert.equal(result.length, 6);
     const names = result.map((s) => s.name);
     assert.deepStrictEqual(names, [
       'cat-cafe-collab',
       'cat-cafe-memory',
       'cat-cafe-signals',
       'cat-cafe-limb',
+      'cat-cafe-audio',
       'cat-cafe-finance',
     ]);
 
     const entrypoints = result.map((s) => s.args[0].split('/').pop());
-    assert.deepStrictEqual(entrypoints, ['collab.js', 'memory.js', 'signals.js', 'limb.js', 'finance.js']);
+    assert.deepStrictEqual(entrypoints, ['collab.js', 'memory.js', 'signals.js', 'limb.js', 'audio.js', 'finance.js']);
   });
 
   it('falls back to .mcp.json for non-builtin servers', () => {

@@ -1,5 +1,6 @@
 'use client';
 
+import type { CapabilityTipContext } from '@cat-cafe/shared';
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { useAgentHookHealth } from '@/hooks/useAgentHookHealth';
@@ -43,6 +44,7 @@ import { ChatContainerHeader } from './ChatContainerHeader';
 import { ChatInput } from './ChatInput';
 import { ChatMessage } from './ChatMessage';
 import { ConnectionStatusBar } from './ConnectionStatusBar';
+import { getStreamingTipContexts, isStreamingTipSuppressedByStatus } from './capability-tip-placement';
 import { FirstRunQuestWizard } from './FirstRunQuestWizard';
 import { BootcampGuideOverlay } from './first-run-quest/BootcampGuideOverlay';
 import { QuestBanner } from './first-run-quest/QuestBanner';
@@ -58,7 +60,9 @@ import { MessageActions } from './MessageActions';
 import { MessageNavigator } from './MessageNavigator';
 import { MobileStatusSheet } from './MobileStatusSheet';
 import { ParallelStatusBar } from './ParallelStatusBar';
+import { PendingMemberBubble } from './PendingMemberBubble';
 import { ProjectSetupCard } from './ProjectSetupCard';
+
 import { QueuePanel } from './QueuePanel';
 import { RightStatusPanel } from './RightStatusPanel';
 import { ScrollToBottomButton } from './ScrollToBottomButton';
@@ -91,6 +95,8 @@ export function ChatContainer({ threadId }: ChatContainerProps) {
     confirmUnreadAck,
     armUnreadSuppression,
     rightPanelMode,
+    setRightPanelMode,
+    closeRightPanel,
   } = useChatStore();
   // F173 Phase C Task 3 — full read-side migration. All thread liveness +
   // messages now flow through thread-scoped selectors keyed off this
@@ -231,6 +237,13 @@ export function ChatContainer({ threadId }: ChatContainerProps) {
     }
   }, [rightPanelMode, statusPanelOpen]);
 
+  // F232 P2（云端 round 5）：显式关闭右侧 panel——先退出 workspace/transcript mode（否则上面的 auto-open
+  // effect 立即重开，关不掉），再关闭。所有 close 入口（header toggle / ResizeHandle 折叠）统一走这里。
+  const closeStatusPanel = useCallback(() => {
+    closeRightPanel();
+    setStatusPanelOpen(false);
+  }, [closeRightPanel]);
+
   const isDesktop = useIsDesktop();
 
   // Desktop: open sidebar before first paint (useLayoutEffect avoids false→true flicker).
@@ -251,10 +264,14 @@ export function ChatContainer({ threadId }: ChatContainerProps) {
   } = useAuthorization(threadId);
 
   // F096: Listen for interactive block send events
+  // F229 Bug 2 fix: ignore events tagged with sendContext (e.g. 'concierge')
+  // to prevent InteractiveBlock clicks in the concierge panel from leaking
+  // "确认"/"取消" text as messages to the main thread.
   useEffect(() => {
     const handler = (e: Event) => {
-      const text = (e as CustomEvent<{ text: string }>).detail.text;
-      if (text) handleSend(text);
+      const detail = (e as CustomEvent<{ text: string; sendContext?: string }>).detail;
+      if (detail.sendContext) return; // belongs to another panel, not main thread
+      if (detail.text) handleSend(detail.text);
     };
     window.addEventListener('cat-cafe:interactive-send', handler);
     return () => window.removeEventListener('cat-cafe:interactive-send', handler);
@@ -620,6 +637,13 @@ export function ChatContainer({ threadId }: ChatContainerProps) {
   // F212 follow-up — UI-layer dedup for adjacent identical CliDiagnostics panels.
   // Compute once per messages change; map is keyed by messageId.
   const cliDedupMap = useMemo(() => computeCliDiagnosticsDedup(messages), [messages]);
+  // F244: Tips show in PendingMemberBubble (the "分析处理中" wait phase), not in
+  // streaming ChatMessage — operator dogfood confirmed pending is the correct timing.
+  // streamingTipMessageId removed; contexts kept for PendingMemberBubble.
+  const pendingTipContexts = useMemo<readonly CapabilityTipContext[]>(
+    () => getStreamingTipContexts(intentMode),
+    [intentMode],
+  );
   const renderSingleMessage = useCallback(
     (msg: ChatMessageData) => {
       const dedupInfo = cliDedupMap.get(msg.id);
@@ -653,6 +677,37 @@ export function ChatContainer({ threadId }: ChatContainerProps) {
   const showThinkingIndicator =
     intentMode === 'execute' ||
     (intentMode == null && hasActiveInvocation && (activeInvocationCount === 1 || singleSpawningTarget));
+
+  // #936: Identify active invocations that don't yet have a corresponding message
+  // bubble — these need a pending placeholder with member avatar + animation.
+  const pendingInvocations = useMemo(() => {
+    if (!hasActiveInvocation || activeInvocationCount === 0) return [];
+    // Collect catIds that already have a streaming/recent assistant message
+    const streamingCatIds = new Set<string>();
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const m = messages[i];
+      if (!m) continue;
+      if (m.type === 'user') break; // stop at last user message boundary
+      if (m.type === 'assistant' && m.catId) {
+        streamingCatIds.add(m.catId);
+      }
+    }
+    // Active invocations without a corresponding bubble = pending
+    return Object.entries(activeInvocations)
+      .filter(([, inv]) => !streamingCatIds.has(inv.catId))
+      .map(([invId, inv]) => ({ invocationId: invId, catId: inv.catId }));
+  }, [hasActiveInvocation, activeInvocationCount, activeInvocations, messages]);
+
+  // F244 dedup: only one pending bubble per thread shows tips (cloud P2).
+  // Pick the first non-stalled pending invocation.
+  const pendingTipInvocationId = useMemo(() => {
+    for (const inv of pendingInvocations) {
+      if (!isStreamingTipSuppressedByStatus(catStatuses[inv.catId])) {
+        return inv.invocationId;
+      }
+    }
+    return null;
+  }, [pendingInvocations, catStatuses]);
 
   useVoiceAutoPlay();
   useVoiceStream();
@@ -839,7 +894,7 @@ export function ChatContainer({ threadId }: ChatContainerProps) {
       <div
         className="flex flex-col min-w-0"
         style={
-          statusPanelOpen && (rightPanelMode === 'workspace' || rightPanelMode === 'transcript')
+          statusPanelOpen && isDesktop && (rightPanelMode === 'workspace' || rightPanelMode === 'transcript')
             ? { flexBasis: `${chatBasis}%`, flexGrow: 0, flexShrink: 0 }
             : { flex: '1 1 0%' }
         }
@@ -853,7 +908,16 @@ export function ChatContainer({ threadId }: ChatContainerProps) {
           onToggleViewMode={() => setViewMode(viewMode === 'single' ? 'split' : 'single')}
           onOpenMobileStatus={() => setMobileStatusOpen(true)}
           statusPanelOpen={statusPanelOpen}
-          onToggleStatusPanel={() => setStatusPanelOpen((v) => !v)}
+          onToggleStatusPanel={() => {
+            if (statusPanelOpen) {
+              closeStatusPanel();
+            } else {
+              // closeRightPanel() 退回 'status' 防 auto-open 循环；重新打开时默认进 workspace
+              // （status/transcript 各有底部工具栏图标单独入口，不需要 PanelTabs tab 栏切换）。
+              setRightPanelMode('workspace');
+              setStatusPanelOpen(true);
+            }
+          }}
           defaultCatId={targetCats[0] || 'opus'}
         />
 
@@ -975,7 +1039,19 @@ export function ChatContainer({ threadId }: ChatContainerProps) {
                 })()}
               </div>
             ) : (
-              messages.map(renderSingleMessage)
+              <>
+                {messages.map(renderSingleMessage)}
+                {pendingInvocations.map((inv) => (
+                  <PendingMemberBubble
+                    key={`pending-${inv.invocationId}`}
+                    catId={inv.catId}
+                    invocationId={inv.invocationId}
+                    catStatus={catStatuses[inv.catId]}
+                    tipContexts={pendingTipContexts}
+                    showCapabilityTip={inv.invocationId === pendingTipInvocationId}
+                  />
+                ))}
+              </>
             )}
             <div ref={messagesEndRef} />
           </main>
@@ -1122,52 +1198,54 @@ export function ChatContainer({ threadId }: ChatContainerProps) {
         />
       </div>
 
-      {statusPanelOpen && rightPanelMode === 'status' && (
+      {/* P2-2（云端 review）：右侧 panel 仅桌面渲染——小屏走 MobileStatusSheet。 */}
+      {statusPanelOpen && isDesktop && (
         <>
-          <div className="hidden lg:flex">
+          {/* rightPanelMode：status 固定宽（statusPanelWidth）；workspace/transcript 百分比（chatBasis）。
+              mode 切换从底部工具栏图标触发（ChatVoiceFeatureControls / header toggle），面板内不再有 tab 栏。 */}
+          {rightPanelMode === 'status' ? (
+            <div className="hidden lg:flex">
+              <ResizeHandle
+                direction="horizontal"
+                label="右侧面板"
+                onResize={handleStatusPanelResize}
+                onCollapse={closeStatusPanel}
+                onDoubleClick={resetStatusPanelWidth}
+              />
+            </div>
+          ) : (
             <ResizeHandle
               direction="horizontal"
-              label="右侧状态栏"
-              onResize={handleStatusPanelResize}
-              onCollapse={() => setStatusPanelOpen(false)}
-              onDoubleClick={resetStatusPanelWidth}
+              label="右侧面板"
+              onResize={handleHorizontalResize}
+              onCollapse={closeStatusPanel}
+              onDoubleClick={resetChatBasis}
             />
+          )}
+          <div
+            className="flex flex-col min-h-0 overflow-hidden"
+            style={
+              rightPanelMode === 'status' ? { width: statusPanelWidth, flexShrink: 0 } : { flex: '1 1 0%', minWidth: 0 }
+            }
+          >
+            <div className="flex min-h-0 flex-1 overflow-hidden">
+              {rightPanelMode === 'status' && (
+                <RightStatusPanel
+                  intentMode={intentMode}
+                  targetCats={targetCats}
+                  catStatuses={catStatuses}
+                  catInvocations={catInvocations}
+                  activeInvocations={activeInvocations}
+                  hasActiveInvocation={hasActiveInvocation}
+                  threadId={threadId}
+                  messageSummary={messageSummary}
+                  width={statusPanelWidth}
+                />
+              )}
+              {rightPanelMode === 'workspace' && <WorkspacePanel />}
+              {rightPanelMode === 'transcript' && <TranscriptPanel />}
+            </div>
           </div>
-          <RightStatusPanel
-            intentMode={intentMode}
-            targetCats={targetCats}
-            catStatuses={catStatuses}
-            catInvocations={catInvocations}
-            activeInvocations={activeInvocations}
-            hasActiveInvocation={hasActiveInvocation}
-            threadId={threadId}
-            messageSummary={messageSummary}
-            width={statusPanelWidth}
-          />
-        </>
-      )}
-      {statusPanelOpen && rightPanelMode === 'workspace' && (
-        <>
-          <ResizeHandle
-            direction="horizontal"
-            label="右侧工作区"
-            onResize={handleHorizontalResize}
-            onCollapse={() => setStatusPanelOpen(false)}
-            onDoubleClick={resetChatBasis}
-          />
-          <WorkspacePanel />
-        </>
-      )}
-      {statusPanelOpen && rightPanelMode === 'transcript' && (
-        <>
-          <ResizeHandle
-            direction="horizontal"
-            label="右侧转录栏"
-            onResize={handleHorizontalResize}
-            onCollapse={() => setStatusPanelOpen(false)}
-            onDoubleClick={resetChatBasis}
-          />
-          <TranscriptPanel />
         </>
       )}
       <FloatingTranscriptContainer />
