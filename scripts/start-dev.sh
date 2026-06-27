@@ -580,6 +580,35 @@ path_is_within_project() {
     esac
 }
 
+append_unique_pid() {
+    local pid="$1"
+    local existing
+
+    [ -n "$pid" ] || return 0
+    [ "$pid" -gt 1 ] 2>/dev/null || return 0
+    [ "$pid" != "$$" ] || return 0
+    [ "${BASHPID:-}" != "$pid" ] || return 0
+
+    for existing in "${_MANAGED_PIDS[@]:-}"; do
+        [ "$existing" != "$pid" ] || return 0
+    done
+
+    _MANAGED_PIDS+=("$pid")
+}
+
+is_managed_supervisor_command() {
+    local cmd="$1"
+    case "$cmd" in
+        *"$PROJECT_DIR"*"/tsx/dist/cli.mjs watch "*|\
+        *"$PROJECT_DIR"*"/next/dist/bin/next dev"*|\
+        *"$PROJECT_DIR"*"/next/dist/bin/next start"*|\
+        *"$PROJECT_DIR"*"/pnpm run dev"*|\
+        *"$PROJECT_DIR"*"/pnpm run start"*|\
+        *"$PROJECT_DIR"*"/pnpm exec next "*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 guard_port_kill_ownership() {
     local port="$1"
     local name="$2"
@@ -673,22 +702,105 @@ terminate_managed_pids() {
     MANAGED_PIDS=()
 }
 
+collect_managed_supervisors() {
+    local pid="$1"
+    local current="$pid"
+    local parent cmd
+
+    while true; do
+        parent=$(ps -o ppid= -p "$current" 2>/dev/null | tr -d '[:space:]')
+        [ -n "$parent" ] || break
+        [ "$parent" -gt 1 ] 2>/dev/null || break
+        [ "$parent" != "$$" ] || break
+        [ "${BASHPID:-}" != "$parent" ] || break
+
+        cmd=$(ps -o command= -p "$parent" 2>/dev/null || true)
+        is_managed_supervisor_command "$cmd" || break
+
+        append_unique_pid "$parent"
+        current="$parent"
+    done
+}
+
+collect_port_process_tree() {
+    local port="$1"
+    local pid
+
+    _MANAGED_PIDS=()
+    while IFS= read -r pid; do
+        [ -n "$pid" ] || continue
+        append_unique_pid "$pid"
+        collect_managed_supervisors "$pid"
+    done < <(port_listen_pids "$port" || true)
+}
+
+kill_orphaned_project_supervisors() {
+    local label="$1"
+    shift
+    local pattern
+    local pid
+    local found=false
+    local pids=()
+
+    for pattern in "$@"; do
+        while IFS= read -r pid; do
+            [ -n "$pid" ] || continue
+            append_unique_pid "$pid"
+        done < <(pgrep -f "$pattern" 2>/dev/null || true)
+    done
+
+    if [ "${#_MANAGED_PIDS[@]}" -eq 0 ]; then
+        return 0
+    fi
+
+    echo -e "${YELLOW}  检测到残留 ${label} 监督进程，正在清理...${NC}"
+    for pid in "${_MANAGED_PIDS[@]}"; do
+        kill "$pid" 2>/dev/null || true
+    done
+    sleep 1
+
+    for pid in "${_MANAGED_PIDS[@]}"; do
+        if kill -0 "$pid" 2>/dev/null; then
+            pids+=("$pid")
+            found=true
+        fi
+    done
+
+    if [ "$found" = true ]; then
+        echo -e "${YELLOW}  强制终止残留 ${label} 监督进程...${NC}"
+        for pid in "${pids[@]}"; do
+            kill -9 "$pid" 2>/dev/null || true
+        done
+        sleep 1
+    fi
+}
+
 # 杀掉占用端口的进程
 kill_port() {
     local port=$1
     local name=$2
     local pids
+    local pid
     pids=$(port_listen_pids "$port" || true)
     if [ -n "$pids" ]; then
         guard_port_kill_ownership "$port" "$name" "$pids" || return 1
+        collect_port_process_tree "$port"
         echo -e "${YELLOW}  端口 $port ($name) 被占用，正在终止进程...${NC}"
-        echo "$pids" | xargs kill 2>/dev/null || true
+        for pid in "${_MANAGED_PIDS[@]}"; do
+            kill "$pid" 2>/dev/null || true
+        done
         sleep 1
         # 确认已死
         pids=$(port_listen_pids "$port" || true)
         if [ -n "$pids" ]; then
             echo -e "${YELLOW}  强制终止...${NC}"
-            echo "$pids" | xargs kill -9 2>/dev/null || true
+            for pid in "${_MANAGED_PIDS[@]}"; do
+                kill -9 "$pid" 2>/dev/null || true
+            done
+            while IFS= read -r pid; do
+                [ -n "$pid" ] || continue
+                kill -9 "$pid" 2>/dev/null || true
+            done < <(printf '%s\n' "$pids")
             sleep 1
         fi
         pids=$(port_listen_pids "$port" || true)
@@ -702,6 +814,17 @@ kill_port() {
 
 kill_managed_ports() {
     local preview_gateway_port="${PREVIEW_GATEWAY_PORT:-4100}"
+
+    _MANAGED_PIDS=()
+    kill_orphaned_project_supervisors "API" \
+        "$PROJECT_DIR/packages/api/node_modules/.bin/../tsx/dist/cli.mjs watch src/index.ts" \
+        "$PROJECT_DIR/packages/api/node_modules/.bin/tsx watch src/index.ts"
+    _MANAGED_PIDS=()
+    kill_orphaned_project_supervisors "Frontend" \
+        "$PROJECT_DIR/packages/web/node_modules/.bin/next start -p $WEB_PORT" \
+        "$PROJECT_DIR/packages/web/node_modules/.bin/next dev -p $WEB_PORT" \
+        "$PROJECT_DIR/node_modules/.bin/pnpm exec next start -p $WEB_PORT" \
+        "$PROJECT_DIR/node_modules/.bin/pnpm exec next dev -p $WEB_PORT"
 
     kill_port $API_PORT "API"
     kill_port $WEB_PORT "Frontend"
